@@ -1,0 +1,1871 @@
+// SPDX-License-Identifier: GPL-2.0
+// Copyright (C) 2013 - 2018 Intel Corporation
+
+#include <linux/completion.h>
+#include <linux/delay.h>
+#include <linux/device.h>
+#include <linux/dma-mapping.h>
+#include <linux/module.h>
+#include <linux/string.h>
+
+#include <media/media-entity.h>
+#include <media/videobuf2-dma-contig.h>
+#include <media/v4l2-ioctl.h>
+
+#include "ipu.h"
+#include "ipu-bus.h"
+#include "ipu-buttress.h"
+#include "ipu-isys.h"
+#include "ipu-isys-csi2.h"
+#include "ipu-isys-video.h"
+
+static bool wall_clock_ts_on;
+module_param(wall_clock_ts_on, bool, 0660);
+MODULE_PARM_DESC(wall_clock_ts_on, "Timestamp based on REALTIME clock");
+
+static int queue_setup(struct vb2_queue *q,
+		       unsigned int *num_buffers, unsigned int *num_planes,
+		       unsigned int sizes[],
+		       struct device *alloc_devs[]
+			)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	bool use_fmt = false;
+	unsigned int i;
+
+	/* num_planes == 0: we're being called through VIDIOC_REQBUFS */
+	if (!*num_planes) {
+		use_fmt = true;
+		*num_planes = av->mpix.num_planes;
+	}
+
+	for (i = 0; i < *num_planes; i++) {
+		if (use_fmt)
+			sizes[i] = av->mpix.plane_fmt[i].sizeimage;
+		alloc_devs[i] = aq->dev;
+		dev_dbg(&av->isys->adev->dev,
+			"%s: queue setup: plane %d size %u\n",
+			av->vdev.name, i, sizes[i]);
+	}
+
+	return 0;
+}
+
+void ipu_isys_queue_lock(struct vb2_queue *q)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+
+	dev_dbg(&av->isys->adev->dev, "%s: queue lock\n", av->vdev.name);
+	mutex_lock(&av->mutex);
+}
+
+void ipu_isys_queue_unlock(struct vb2_queue *q)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+
+	dev_dbg(&av->isys->adev->dev, "%s: queue unlock\n", av->vdev.name);
+	mutex_unlock(&av->mutex);
+}
+
+static int buf_init(struct vb2_buffer *vb)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+
+	dev_dbg(&av->isys->adev->dev, "buffer: %s: %s\n", av->vdev.name,
+		__func__);
+
+	if (aq->buf_init)
+		return aq->buf_init(vb);
+
+	return 0;
+}
+
+int ipu_isys_buf_prepare(struct vb2_buffer *vb)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+
+	dev_dbg(&av->isys->adev->dev,
+		"buffer: %s: configured size %u, buffer size %lu\n",
+		av->vdev.name,
+		av->mpix.plane_fmt[0].sizeimage, vb2_plane_size(vb, 0));
+
+	if (av->mpix.plane_fmt[0].sizeimage > vb2_plane_size(vb, 0))
+		return -EINVAL;
+
+	vb2_set_plane_payload(vb, 0, av->mpix.plane_fmt[0].bytesperline *
+			      av->mpix.height);
+	vb->planes[0].data_offset = av->line_header_length / BITS_PER_BYTE;
+
+	return 0;
+}
+
+static int buf_prepare(struct vb2_buffer *vb)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	struct ipu_isys_buffer *ib = vb2_buffer_to_ipu_isys_buffer(vb);
+	struct vb2_v4l2_buffer *b = to_vb2_v4l2_buffer(vb);
+	struct ipu_isys_request *ireq;
+	u32 request_state;
+	unsigned long flags;
+	int rval;
+
+	if (av->isys->adev->isp->flr_done)
+		return -EIO;
+
+	if (b->flags & V4L2_BUF_FLAG_REQUEST_FD) {
+		ib->req = media_request_get_by_fd(&av->isys->media_dev, b->request_fd);
+		if (IS_ERR(ib->req)) {
+			dev_err(&av->isys->adev->dev,
+				"can't find request %u (%ld)\n", b->request_fd, PTR_ERR(ib->req));
+			return PTR_ERR(ib->req);
+		} else if (!ib->req) {
+			dev_dbg(&av->isys->adev->dev,
+				"can't find request %u\n", b->request_fd);
+			return -ENOENT;
+		}
+	}
+
+	rval = aq->buf_prepare(vb);
+	if (!ib->req)
+		return rval;
+	if (rval)
+		goto out_put_request;
+
+	ireq = to_ipu_isys_request(ib->req);
+
+	spin_lock_irqsave(&ireq->lock, flags);
+	spin_lock(&ib->req->lock);
+	request_state = ib->req->state;
+	if (request_state == MEDIA_DEVICE_REQUEST_STATE_IDLE)
+		list_add(&ib->req_head, &ireq->buffers);
+	spin_unlock(&ib->req->lock);
+	spin_unlock_irqrestore(&ireq->lock, flags);
+	if (request_state != MEDIA_DEVICE_REQUEST_STATE_IDLE) {
+		dev_dbg(&av->isys->adev->dev,
+			"%s[%s]: request state %u\n", __func__, ib->req->debug_str,
+			request_state);
+		rval = -EINVAL;
+	} else {
+		dev_dbg(&av->isys->adev->dev,
+			"%s[%s]: request\n", __func__, ib->req->debug_str);
+	}
+
+	if (!rval)
+		return 0;
+
+out_put_request:
+	media_request_put(ib->req);
+	ib->req = NULL;
+
+	return rval;
+}
+
+static void buf_finish(struct vb2_buffer *vb)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	struct ipu_isys_buffer *ib = vb2_buffer_to_ipu_isys_buffer(vb);
+
+	dev_dbg(&av->isys->adev->dev, "buffer: %s: %s\n", av->vdev.name,
+		__func__);
+
+	if (ib->req) {
+		struct ipu_isys_request *ireq = to_ipu_isys_request(ib->req);
+		unsigned long flags;
+		bool done;
+
+		spin_lock_irqsave(&ireq->lock, flags);
+		list_del(&ib->req_head);
+		done = list_empty(&ireq->buffers);
+		spin_unlock_irqrestore(&ireq->lock, flags);
+		dev_dbg(&av->isys->adev->dev, "%s: request complete %s\n",
+			ib->req->debug_str, done ? "true" : "false");
+		if (done) {
+			v4l2_ctrl_request_complete(ib->req,
+						      av->vdev.ctrl_handler);
+			mutex_lock(&av->isys->stream_mutex);
+			list_del_init(&ireq->head);
+			mutex_unlock(&av->isys->stream_mutex);
+		}
+		media_request_put(ib->req);
+		ib->req = NULL;
+	}
+}
+
+static void buf_cleanup(struct vb2_buffer *vb)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+
+	dev_dbg(&av->isys->adev->dev, "buffer: %s: %s\n", av->vdev.name,
+		__func__);
+
+	if (aq->buf_cleanup)
+		return aq->buf_cleanup(vb);
+}
+
+/*
+ * Queue a buffer list back to incoming or active queues. The buffers
+ * are removed from the buffer list.
+ */
+void ipu_isys_buffer_list_queue(struct ipu_isys_buffer_list *bl,
+				unsigned long op_flags,
+				enum vb2_buffer_state state)
+{
+	struct ipu_isys_buffer *ib, *ib_safe;
+	unsigned long flags;
+	bool first = true;
+
+	if (!bl)
+		return;
+
+	WARN_ON(!bl->nbufs);
+	WARN_ON(op_flags & IPU_ISYS_BUFFER_LIST_FL_ACTIVE &&
+		op_flags & IPU_ISYS_BUFFER_LIST_FL_INCOMING);
+
+	list_for_each_entry_safe(ib, ib_safe, &bl->head, head) {
+		struct ipu_isys_video *av;
+
+		if (ib->type == IPU_ISYS_VIDEO_BUFFER) {
+			struct vb2_buffer *vb =
+			    ipu_isys_buffer_to_vb2_buffer(ib);
+			struct ipu_isys_queue *aq =
+			    vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+
+			av = ipu_isys_queue_to_video(aq);
+			spin_lock_irqsave(&aq->lock, flags);
+			list_del_init(&ib->head);
+			/*
+			 * A buffer completed to vb2 is owned by user space
+			 * again and must NOT stay linked on a driver list:
+			 * the next QBUF would list_add the same node a
+			 * second time and corrupt the queue (crashes the
+			 * first time a stream start fails and the app
+			 * retries, e.g. wireplumber).
+			 */
+			if (!(op_flags & IPU_ISYS_BUFFER_LIST_FL_SET_STATE)) {
+				if (op_flags & IPU_ISYS_BUFFER_LIST_FL_ACTIVE)
+					list_add(&ib->head, &aq->active);
+				else if (op_flags &
+					 IPU_ISYS_BUFFER_LIST_FL_INCOMING)
+					list_add_tail(&ib->head,
+						      &aq->incoming);
+			}
+			spin_unlock_irqrestore(&aq->lock, flags);
+
+			if (op_flags & IPU_ISYS_BUFFER_LIST_FL_SET_STATE)
+				vb2_buffer_done(vb, state);
+		} else if (ib->type == IPU_ISYS_SHORT_PACKET_BUFFER) {
+			struct ipu_isys_private_buffer *pb =
+			    ipu_isys_buffer_to_private_buffer(ib);
+			struct ipu_isys_pipeline *ip = pb->ip;
+
+			av = container_of(ip, struct ipu_isys_video, ip);
+			spin_lock_irqsave(&ip->short_packet_queue_lock, flags);
+			list_del(&ib->head);
+			if (op_flags & IPU_ISYS_BUFFER_LIST_FL_ACTIVE)
+				list_add(&ib->head, &ip->short_packet_active);
+			else if (op_flags & IPU_ISYS_BUFFER_LIST_FL_INCOMING)
+				list_add(&ib->head, &ip->short_packet_incoming);
+			spin_unlock_irqrestore(&ip->short_packet_queue_lock,
+					       flags);
+		} else {
+			WARN_ON(1);
+			return;
+		}
+
+		if (first) {
+			dev_dbg(&av->isys->adev->dev,
+				"queue buffer list %p op_flags %lx, state %d, %d buffers\n",
+				bl, op_flags, state, bl->nbufs);
+			first = false;
+		}
+
+		bl->nbufs--;
+	}
+
+	WARN_ON(bl->nbufs);
+}
+
+/*
+ * flush_firmware_streamon_fail() - Flush in cases where requests may
+ * have been queued to firmware and the *firmware streamon fails for a
+ * reason or another.  The caller supplies QUEUED for a vb2 start callback
+ * failure and ERROR when a running stream's deferred submission fails.
+ */
+static void flush_firmware_streamon_fail(struct ipu_isys_pipeline *ip,
+					 enum vb2_buffer_state state)
+{
+	struct ipu_isys_video *pipe_av =
+	    container_of(ip, struct ipu_isys_video, ip);
+	struct ipu_isys_buffer_list bl;
+	struct ipu_isys_queue *aq;
+	unsigned long flags;
+
+	lockdep_assert_held(&pipe_av->mutex);
+
+	INIT_LIST_HEAD(&bl.head);
+	bl.nbufs = 0;
+
+	list_for_each_entry(aq, &ip->queues, node) {
+		struct ipu_isys_buffer *ib, *ib_safe;
+
+		spin_lock_irqsave(&aq->lock, flags);
+		list_for_each_entry_safe(ib, ib_safe, &aq->active, head) {
+			list_move_tail(&ib->head, &bl.head);
+			bl.nbufs++;
+		}
+		spin_unlock_irqrestore(&aq->lock, flags);
+	}
+
+	/* Complete detached buffers once, outside the queue spinlocks. */
+	if (bl.nbufs)
+		ipu_isys_buffer_list_queue(&bl,
+					   IPU_ISYS_BUFFER_LIST_FL_SET_STATE,
+					   state);
+}
+
+/*
+ * Attempt obtaining a buffer list from the incoming queues, a list of
+ * buffers that contains one entry from each video buffer queue. If
+ * all queues have no buffers, the buffers that were already dequeued
+ * are returned to their queues.
+ */
+static int buffer_list_get(struct ipu_isys_pipeline *ip,
+			   struct ipu_isys_buffer_list *bl)
+{
+	struct ipu_isys_queue *aq;
+	struct ipu_isys_buffer *ib;
+	unsigned long flags;
+	int ret = 0;
+
+	bl->nbufs = 0;
+	INIT_LIST_HEAD(&bl->head);
+
+	list_for_each_entry(aq, &ip->queues, node) {
+		struct ipu_isys_buffer *ib;
+
+		spin_lock_irqsave(&aq->lock, flags);
+		if (list_empty(&aq->incoming)) {
+			spin_unlock_irqrestore(&aq->lock, flags);
+			ret = -ENODATA;
+			goto error;
+		}
+
+		ib = list_last_entry(&aq->incoming,
+				     struct ipu_isys_buffer, head);
+		if (ib->req) {
+			spin_unlock_irqrestore(&aq->lock, flags);
+			ret = -ENODATA;
+			goto error;
+		}
+
+		dev_dbg(&ip->isys->adev->dev, "buffer: %s: buffer %u\n",
+			ipu_isys_queue_to_video(aq)->vdev.name,
+			ipu_isys_buffer_to_vb2_buffer(ib)->index
+		    );
+		list_del(&ib->head);
+		list_add(&ib->head, &bl->head);
+		spin_unlock_irqrestore(&aq->lock, flags);
+
+		bl->nbufs++;
+	}
+
+	list_for_each_entry(ib, &bl->head, head) {
+		struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+
+		aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+		if (aq->prepare_frame_buff_set)
+			aq->prepare_frame_buff_set(vb);
+	}
+
+	/* Get short packet buffer. */
+	if (ip->interlaced && ip->isys->short_packet_source ==
+	    IPU_ISYS_SHORT_PACKET_FROM_RECEIVER) {
+		spin_lock_irqsave(&ip->short_packet_queue_lock, flags);
+		ib = ipu_isys_csi2_get_short_packet_buffer(ip);
+		if (!ib) {
+			spin_unlock_irqrestore(&ip->short_packet_queue_lock,
+					       flags);
+			ret = -ENODATA;
+			dev_err(&ip->isys->adev->dev,
+				"No more short packet buffers. Driver bug?");
+			WARN_ON(1);
+			goto error;
+		}
+		list_move(&ib->head, &bl->head);
+		spin_unlock_irqrestore(&ip->short_packet_queue_lock, flags);
+		bl->nbufs++;
+	}
+
+	dev_dbg(&ip->isys->adev->dev, "get buffer list %p, %u buffers\n", bl,
+		bl->nbufs);
+	return ret;
+
+error:
+	if (!list_empty(&bl->head))
+		ipu_isys_buffer_list_queue(bl,
+					   IPU_ISYS_BUFFER_LIST_FL_INCOMING, 0);
+	return ret;
+}
+
+void ipu_isys_buffer_list_to_ipu_fw_isys_frame_buff_set_pin(
+			struct vb2_buffer *vb,
+			struct ipu_fw_isys_frame_buff_set_abi *set)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+
+	set->output_pins[aq->fw_output].addr =
+	    vb2_dma_contig_plane_dma_addr(vb, 0);
+	set->output_pins[aq->fw_output].out_buf_id =
+	    vb->index + 1;
+}
+
+/*
+ * Convert a buffer list to a isys fw ABI framebuffer set. The
+ * buffer list is not modified.
+ */
+void ipu_isys_buffer_list_to_ipu_fw_isys_frame_buff_set(
+			struct ipu_fw_isys_frame_buff_set_abi *set,
+			struct ipu_isys_pipeline *ip,
+			struct ipu_isys_buffer_list *bl)
+{
+	struct ipu_isys_buffer *ib;
+
+	WARN_ON(!bl->nbufs);
+
+	set->send_irq_sof = 1;
+	set->send_resp_sof = 1;
+
+#if defined(CONFIG_VIDEO_INTEL_IPU4) || defined(CONFIG_VIDEO_INTEL_IPU4P)
+	set->send_irq_capture_ack = 1;
+	set->send_irq_capture_done = 1;
+	set->send_irq_eof = 1;
+	set->send_resp_eof = 1;
+#else
+	set->send_irq_eof = 0;
+	set->send_resp_eof = 0;
+#endif
+
+	list_for_each_entry(ib, &bl->head, head) {
+		if (ib->type == IPU_ISYS_VIDEO_BUFFER) {
+			struct vb2_buffer *vb =
+			    ipu_isys_buffer_to_vb2_buffer(ib);
+			struct ipu_isys_queue *aq =
+			    vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+
+			if (aq->fill_frame_buff_set_pin)
+				aq->fill_frame_buff_set_pin(vb, set);
+		} else if (ib->type == IPU_ISYS_SHORT_PACKET_BUFFER) {
+			struct ipu_isys_private_buffer *pb =
+			    ipu_isys_buffer_to_private_buffer(ib);
+			struct ipu_fw_isys_output_pin_payload_abi *output_pin =
+			    &set->output_pins[ip->short_packet_output_pin];
+
+			output_pin->addr = pb->dma_addr;
+			output_pin->out_buf_id = pb->index + 1;
+		} else {
+			WARN_ON(1);
+		}
+	}
+}
+
+static void
+ipu_isys_req_buffer_list_queue(struct ipu_isys_request *ireq,
+			       enum vb2_buffer_state state)
+{
+	struct ipu_isys_buffer_list bl;
+	struct ipu_isys_buffer *ib;
+	unsigned long flags;
+
+	INIT_LIST_HEAD(&bl.head);
+	bl.nbufs = 0;
+
+	/* Detach every prepared buffer before completing it outside the locks. */
+	spin_lock_irqsave(&ireq->lock, flags);
+	list_for_each_entry(ib, &ireq->buffers, req_head) {
+		struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+		struct ipu_isys_queue *aq =
+		    vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+
+		spin_lock(&aq->lock);
+		if (!list_empty(&ib->head)) {
+			list_del_init(&ib->head);
+			list_add_tail(&ib->head, &bl.head);
+			bl.nbufs++;
+		}
+		spin_unlock(&aq->lock);
+	}
+	spin_unlock_irqrestore(&ireq->lock, flags);
+
+	if (bl.nbufs)
+		ipu_isys_buffer_list_queue(&bl,
+					   IPU_ISYS_BUFFER_LIST_FL_SET_STATE,
+					   state);
+}
+
+static int
+ipu_isys_req_dispatch(struct media_device *mdev,
+		      struct ipu_isys_request *ireq,
+		      struct ipu_isys_pipeline *ip,
+		      struct ipu_fw_isys_frame_buff_set_abi *set,
+		      dma_addr_t dma_addr);
+
+static struct ipu_isys_request *
+ipu_isys_find_queued_request(struct ipu_isys_pipeline *ip, bool dequeue)
+{
+	struct ipu_isys *isys =
+	    container_of(ip, struct ipu_isys_video, ip)->isys;
+	struct ipu_isys_request *ireq;
+	struct ipu_isys_buffer *ib;
+	unsigned long flags;
+
+	lockdep_assert_held(&isys->stream_mutex);
+
+	if (list_empty(&isys->requests)) {
+		dev_dbg(&isys->adev->dev, "%s: no requests found\n", __func__);
+		return NULL;
+	}
+
+	list_for_each_entry_reverse(ireq, &isys->requests, head) {
+		/* Does the request belong to this pipeline? */
+		bool is_ours = false;
+		bool is_others = false;
+
+		dev_dbg(&isys->adev->dev, "%s[%s]: checking request\n",
+			__func__, ireq->req.debug_str);
+
+		spin_lock_irqsave(&ireq->lock, flags);
+		list_for_each_entry(ib, &ireq->buffers, req_head) {
+			struct vb2_buffer *vb =
+			    ipu_isys_buffer_to_vb2_buffer(ib);
+			struct ipu_isys_queue *aq =
+			    vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+			struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+
+			dev_dbg(&isys->adev->dev, "%s: buffer in vdev %s\n",
+				__func__, av->vdev.name);
+
+			if (media_entity_enum_test(&ip->entity_enum,
+						   &av->vdev.entity))
+				is_ours = true;
+			else
+				is_others = true;
+		}
+		spin_unlock_irqrestore(&ireq->lock, flags);
+
+		dev_dbg(&isys->adev->dev, "%s: is%s ours, is%s others'\n",
+			__func__, is_ours ? "" : "n't", is_others ? "" : "n't");
+
+		if (!is_ours || WARN_ON(is_others))
+			continue;
+
+		if (dequeue)
+			list_del_init(&ireq->head);
+
+		return ireq;
+	}
+
+	return NULL;
+}
+
+struct ipu_isys_request *ipu_isys_next_queued_request(struct ipu_isys_pipeline
+						      *ip)
+{
+	return ipu_isys_find_queued_request(ip, true);
+}
+
+/* Start streaming for real. The buffer list must be available. */
+/*
+ * Feed any buffers waiting on the incoming queues to the firmware.
+ * Same per-buffer-set flow as the tail of ipu_isys_stream_start;
+ * best effort - stops when the incoming queues are empty and propagates
+ * send failures so stream start can roll back active buffers.
+ */
+static int stream_capture_refeed(struct ipu_isys_pipeline *ip)
+{
+	struct ipu_isys_video *pipe_av =
+	    container_of(ip, struct ipu_isys_video, ip);
+	struct ipu_isys_buffer_list bl;
+	int rval;
+
+	do {
+		struct ipu_fw_isys_frame_buff_set_abi *buf;
+		struct isys_fw_msgs *msg;
+
+		rval = buffer_list_get(ip, &bl);
+		if (rval < 0)
+			return rval == -ENODATA ? 0 : rval;
+
+		msg = ipu_get_fw_msg_buf(ip);
+		if (!msg) {
+			ipu_isys_buffer_list_queue(&bl,
+					IPU_ISYS_BUFFER_LIST_FL_INCOMING, 0);
+			return -ENOMEM;
+		}
+
+		buf = to_frame_msg_buf(msg);
+
+		ipu_isys_buffer_list_to_ipu_fw_isys_frame_buff_set(buf, ip,
+								   &bl);
+		ipu_isys_buffer_list_queue(&bl,
+					   IPU_ISYS_BUFFER_LIST_FL_ACTIVE, 0);
+		rval = ipu_fw_isys_complex_cmd(pipe_av->isys,
+					ip->stream_handle,
+					buf, to_dma_addr(msg),
+					sizeof(*buf),
+					IPU_FW_ISYS_SEND_TYPE_STREAM_CAPTURE);
+		ipu_put_fw_mgs_buffer(pipe_av->isys, (uintptr_t) buf);
+		if (rval)
+			return rval;
+	} while (1);
+}
+
+/*
+ * Verify a just-started stream actually delivers error-free frames,
+ * bouncing the external sensor's s_stream if not.
+ *
+ * On marginal links (SP7 front ov5693, 419.2 MHz x2) the D-PHY
+ * clock-lane settle/DLL lock at the sensor's LP->HS transition fails on
+ * a large fraction of stream starts, and a missed initial SOT sync is
+ * non-recoverable for the whole stream. Bouncing the sensor's s_stream
+ * re-runs the LP->HS transition and re-rolls the lock.
+ *
+ * SOF/receiver-error heuristics are ambiguous during start-up (healthy
+ * locks emit error blips, failed locks emit SOFs and STR2MMIO-flagged
+ * frames), so judge by the only unambiguous signal: error-free frames
+ * delivered by the firmware.
+ *
+ * A failed lock consumes one buffer per corrupt frame, which would
+ * starve the fw (user space cannot requeue - it is still blocked in
+ * STREAMON) and make a successful bounce unobservable. verify_active
+ * makes ipu_isys_queue_buf_ready park those buffers back on the
+ * incoming queues, and each bounce re-feeds them to the fw.
+ *
+ * If the link never produces a clean frame or a sensor bounce fails, the
+ * caller rolls the stream back and returns its buffers before reporting
+ * STREAMON failure.
+ */
+static int verify_stream_start(struct ipu_isys_pipeline *ip,
+			       unsigned int frames_done_before_start)
+{
+	struct ipu_isys_video *pipe_av =
+	    container_of(ip, struct ipu_isys_video, ip);
+	struct device *dev = &pipe_av->isys->adev->dev;
+	struct v4l2_subdev *esd;
+	unsigned long flags;
+	unsigned int retry, tick;
+	u32 fatal_receiver_errors, last_receiver_errors;
+	int rval;
+
+	if (!ip->csi2 || !ip->external || ip->interlaced)
+		return 0;
+	if (atomic_read(&ip->frames_done) != frames_done_before_start)
+		return 0;
+
+	esd = media_entity_to_v4l2_subdev(ip->external->entity);
+
+	atomic_set(&ip->verify_active, 1);
+
+	/*
+	 * Lock probability per attempt varies session to session (observed
+	 * ~20-70%); 30 retries keeps the miss-all chance negligible even on
+	 * bad days, and costs nothing when the lock comes early (the loop
+	 * exits on the first error-free frame). Observe the final attempt too;
+	 * exhausting the retry budget is a stream-start failure.
+	 */
+	rval = -ETIMEDOUT;
+	for (retry = 0; retry <= 30; retry++) {
+		if (atomic_read(&ip->frames_done) != frames_done_before_start) {
+			rval = 0;
+			break;
+		}
+		for (tick = 0; tick < 12; tick++) {
+			msleep(50);
+			if (atomic_read(&ip->frames_done) !=
+			    frames_done_before_start)
+				break;
+		}
+		if (atomic_read(&ip->frames_done) != frames_done_before_start) {
+			rval = 0;
+			break;
+		}
+		if (retry == 30) {
+			dev_err(dev,
+				"no clean frames from %s after %u sensor attempts\n",
+				ip->external->entity->name, retry + 1);
+			break;
+		}
+		dev_warn_ratelimited(dev,
+			 "no frames from %s after start; bouncing sensor (retry %u)\n",
+			 ip->external->entity->name, retry + 1);
+		rval = v4l2_subdev_call(esd, video, s_stream, 0);
+		if (rval) {
+			dev_err(dev,
+				"sensor bounce s_stream(0) failed for %s: %d\n",
+				ip->external->entity->name, rval);
+			break;
+		}
+		/*
+		 * Startup receiver errors are ambiguous on the marginal front
+		 * link: a missed first frame-sync is expected when the sensor's
+		 * LP->HS clock-lane lock fails, and bouncing s_stream is the
+		 * recovery. Drain and report errors, but use clean frame delivery
+		 * below as the success criterion instead of vetoing the bounce.
+		 */
+		rval = ipu_isys_csi2_error(ip->csi2);
+		spin_lock_irqsave(&ip->csi2->receiver_error_lock, flags);
+		fatal_receiver_errors = ip->csi2->fatal_receiver_errors;
+		last_receiver_errors = ip->csi2->last_receiver_errors;
+		spin_unlock_irqrestore(&ip->csi2->receiver_error_lock, flags);
+		if (rval || fatal_receiver_errors) {
+			dev_warn_ratelimited(dev,
+				"CSI-2 startup errors 0x%x; retrying sensor bounce\n",
+				last_receiver_errors);
+		}
+		msleep(20);
+		rval = v4l2_subdev_call(esd, video, s_stream, 1);
+		if (rval) {
+			dev_err(dev,
+				"sensor bounce s_stream(1) failed for %s: %d\n",
+				ip->external->entity->name, rval);
+			break;
+		}
+		/* hand parked (corrupt-frame) buffers back to the fw */
+		rval = stream_capture_refeed(ip);
+		if (rval)
+			break;
+		rval = -ETIMEDOUT;
+	}
+
+	/*
+	 * Stop parking first, then hand back any buffer parked since
+	 * the last refeed, so nothing is left stranded on incoming.
+	 */
+	atomic_set(&ip->verify_active, 0);
+	if (!rval)
+		rval = stream_capture_refeed(ip);
+	else
+		stream_capture_refeed(ip);
+
+	return rval;
+}
+
+static int ipu_isys_stream_start(struct ipu_isys_pipeline *ip,
+				 struct ipu_isys_buffer_list *bl, bool error)
+{
+	struct ipu_isys_video *pipe_av =
+	    container_of(ip, struct ipu_isys_video, ip);
+	struct media_device *mdev = &pipe_av->isys->media_dev;
+	struct ipu_isys_buffer_list __bl;
+	struct ipu_isys_request *ireq = NULL;
+	unsigned int frames_done_before_start = atomic_read(&ip->frames_done);
+	bool stream_started = false;
+	enum vb2_buffer_state buffer_state = error ? VB2_BUF_STATE_ERROR :
+		VB2_BUF_STATE_QUEUED;
+	int rval;
+
+	mutex_lock(&pipe_av->isys->stream_mutex);
+	/* Remember the request start_stream_firmware may dequeue on failure. */
+	ireq = ipu_isys_find_queued_request(ip, false);
+
+	dev_info(&pipe_av->isys->adev->dev,
+		 "IRTRACE pipeline stream begin source=%u frames_done=%u\n",
+		 ip->source, frames_done_before_start);
+	rval = ipu_isys_video_set_streaming(pipe_av, 1, bl);
+	if (rval) {
+		mutex_unlock(&pipe_av->isys->stream_mutex);
+		goto out_requeue;
+	}
+	dev_info(&pipe_av->isys->adev->dev,
+		 "IRTRACE pipeline stream configured source=%u handle=%d\n",
+		 ip->source, ip->stream_handle);
+
+	ip->streaming = 1;
+	stream_started = true;
+	if (bl && ireq && list_empty(&ireq->head)) {
+		/* start_stream_firmware used bl and otherwise drops its request. */
+		list_add_tail(&ireq->head, &pipe_av->isys->requests);
+		ireq = NULL;
+	} else if (!bl) {
+		/* A request was submitted as the start buffer when streaming began. */
+		ireq = NULL;
+	}
+
+	dev_dbg(&pipe_av->isys->adev->dev, "dispatching queued requests\n");
+
+	while ((ireq = ipu_isys_next_queued_request(ip))) {
+		struct ipu_fw_isys_frame_buff_set_abi *set;
+		struct isys_fw_msgs *msg;
+
+		msg = ipu_get_fw_msg_buf(ip);
+		if (!msg) {
+			rval = -ENOMEM;
+			mutex_unlock(&pipe_av->isys->stream_mutex);
+			goto out_requeue;
+		}
+
+		set = to_frame_msg_buf(msg);
+
+		rval = ipu_isys_req_prepare(mdev, ireq, ip, set);
+		if (rval) {
+			ipu_put_fw_mgs_buffer(pipe_av->isys, (uintptr_t)set);
+			mutex_unlock(&pipe_av->isys->stream_mutex);
+			goto out_requeue;
+		}
+
+		ipu_fw_isys_dump_frame_buff_set(&pipe_av->isys->adev->dev, set,
+						ip->nr_output_pins);
+		rval = ipu_isys_req_dispatch(mdev, ireq, ip, set,
+					      to_dma_addr(msg));
+		if (rval) {
+			mutex_unlock(&pipe_av->isys->stream_mutex);
+			goto out_requeue;
+		}
+	}
+
+	dev_dbg(&pipe_av->isys->adev->dev,
+		"done dispatching queued requests\n");
+
+	mutex_unlock(&pipe_av->isys->stream_mutex);
+
+	bl = &__bl;
+
+	do {
+		struct ipu_fw_isys_frame_buff_set_abi *buf = NULL;
+		struct isys_fw_msgs *msg;
+
+		rval = buffer_list_get(ip, bl);
+		if (rval == -ENODATA) {
+			/* The initial buffer was already submitted by stream-on. */
+			rval = 0;
+			break;
+		}
+		if (rval == -EINVAL)
+			goto out_requeue;
+		else if (rval < 0)
+			break;
+
+		msg = ipu_get_fw_msg_buf(ip);
+		if (!msg) {
+			rval = -ENOMEM;
+			goto out_requeue;
+		}
+
+		buf = to_frame_msg_buf(msg);
+
+		ipu_isys_buffer_list_to_ipu_fw_isys_frame_buff_set(buf, ip, bl);
+
+		ipu_fw_isys_dump_frame_buff_set(&pipe_av->isys->adev->dev, buf,
+						ip->nr_output_pins);
+
+		ipu_isys_buffer_list_queue(bl,
+					   IPU_ISYS_BUFFER_LIST_FL_ACTIVE, 0);
+
+		rval = ipu_fw_isys_complex_cmd(pipe_av->isys,
+					ip->stream_handle,
+					buf, to_dma_addr(msg),
+						sizeof(*buf),
+						IPU_FW_ISYS_SEND_TYPE_STREAM_CAPTURE);
+		ipu_put_fw_mgs_buffer(pipe_av->isys, (uintptr_t) buf);
+	} while (!rval);
+
+	if (rval)
+		goto out_requeue;
+
+	/*
+	 * Only now, with every queued buffer handed to the firmware, can
+	 * stream health be judged (and a D-PHY relock bounce actually
+	 * result in observable frames); see the function's comment.
+	 */
+	rval = verify_stream_start(ip, frames_done_before_start);
+	if (rval)
+		goto out_requeue;
+
+	return 0;
+
+out_requeue:
+	if (stream_started) {
+		/*
+		 * The stream is live once ipu_isys_video_set_streaming()
+		 * returns.  Undo that state before returning STREAMON failure;
+		 * otherwise the next open sees the subdevs as already streaming.
+		 */
+		int stop_rval;
+
+		mutex_lock(&pipe_av->isys->stream_mutex);
+		stop_rval = ipu_isys_video_set_streaming(pipe_av, 0, NULL);
+		mutex_unlock(&pipe_av->isys->stream_mutex);
+		if (stop_rval) {
+			dev_err(&pipe_av->isys->adev->dev,
+				"failed to stop pipeline after stream-start error: %d\n",
+				stop_rval);
+		}
+		/* A failed start must never leave the software pipeline streaming. */
+		ip->streaming = 0;
+	}
+
+	/* The selected request was removed from isys->requests already. */
+	if (ireq)
+		ipu_isys_req_buffer_list_queue(ireq, VB2_BUF_STATE_ERROR);
+
+	if (bl && bl->nbufs)
+		ipu_isys_buffer_list_queue(bl,
+					   IPU_ISYS_BUFFER_LIST_FL_INCOMING |
+					   (error ?
+					    IPU_ISYS_BUFFER_LIST_FL_SET_STATE :
+					    0),
+					   buffer_state);
+	flush_firmware_streamon_fail(ip, buffer_state);
+
+	return rval;
+}
+
+/* Complete only buffers from a failed capture submission. */
+static void buffer_list_active_error(struct ipu_isys_pipeline *ip,
+				     struct ipu_isys_buffer **buffers,
+				     unsigned int nbufs)
+{
+	struct ipu_isys_buffer_list bl;
+	unsigned long flags;
+	unsigned int i;
+
+	INIT_LIST_HEAD(&bl.head);
+	bl.nbufs = 0;
+
+	for (i = 0; i < nbufs; i++) {
+		struct ipu_isys_buffer *ib = buffers[i];
+
+		if (ib->type == IPU_ISYS_VIDEO_BUFFER) {
+			struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+			struct ipu_isys_queue *aq =
+			    vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+			struct ipu_isys_buffer *active;
+
+			spin_lock_irqsave(&aq->lock, flags);
+			list_for_each_entry(active, &aq->active, head) {
+				if (active != ib)
+					continue;
+
+				list_del_init(&ib->head);
+				list_add_tail(&ib->head, &bl.head);
+				bl.nbufs++;
+				break;
+			}
+			spin_unlock_irqrestore(&aq->lock, flags);
+		} else if (ib->type == IPU_ISYS_SHORT_PACKET_BUFFER) {
+			struct ipu_isys_buffer *active;
+
+			spin_lock_irqsave(&ip->short_packet_queue_lock, flags);
+			list_for_each_entry(active, &ip->short_packet_active, head) {
+				if (active != ib)
+					continue;
+
+				list_move(&ib->head, &ip->short_packet_incoming);
+				break;
+			}
+			spin_unlock_irqrestore(&ip->short_packet_queue_lock, flags);
+		} else {
+			WARN_ON(1);
+		}
+	}
+
+	if (bl.nbufs)
+		ipu_isys_buffer_list_queue(&bl,
+					   IPU_ISYS_BUFFER_LIST_FL_SET_STATE,
+					   VB2_BUF_STATE_ERROR);
+}
+
+static void __buf_queue(struct vb2_buffer *vb, bool force)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	struct ipu_isys_buffer *ib = vb2_buffer_to_ipu_isys_buffer(vb);
+	struct ipu_isys_pipeline *ip =
+	    to_ipu_isys_pipeline(media_entity_pipeline(&av->vdev.entity));
+	struct ipu_isys_buffer_list bl;
+
+	struct ipu_fw_isys_frame_buff_set_abi *buf = NULL;
+	struct isys_fw_msgs *msg;
+	struct ipu_isys_buffer *queued[IPU_ISYS_OUTPUT_PINS + 1];
+
+	struct ipu_isys_video *pipe_av =
+	    container_of(ip, struct ipu_isys_video, ip);
+	struct ipu_isys_buffer *list_ib;
+	unsigned long flags;
+	unsigned int i, nqueued = 0;
+	int rval;
+
+	dev_dbg(&av->isys->adev->dev, "buffer: %s: buf_queue %u\n",
+		av->vdev.name,
+		vb->index
+	    );
+
+	for (i = 0; i < vb->num_planes; i++)
+		dev_dbg(&av->isys->adev->dev, "iova: plane %u iova 0x%x\n", i,
+			(u32) vb2_dma_contig_plane_dma_addr(vb, i));
+
+	spin_lock_irqsave(&aq->lock, flags);
+	list_add(&ib->head, &aq->incoming);
+	spin_unlock_irqrestore(&aq->lock, flags);
+
+	if (ib->req)
+		return;
+
+	if (!pipe_av || !vb->vb2_queue->streaming) {
+		dev_dbg(&av->isys->adev->dev,
+			"not pipe_av set, adding to incoming\n");
+		return;
+	}
+
+	mutex_unlock(&av->mutex);
+	mutex_lock(&pipe_av->mutex);
+
+	if (!force && ip->nr_streaming != ip->nr_queues) {
+		dev_dbg(&av->isys->adev->dev,
+			"not streaming yet, adding to incoming\n");
+		goto out;
+	}
+
+	/*
+	 * We just put one buffer to the incoming list of this queue
+	 * (above). Let's see whether all queues in the pipeline would
+	 * have a buffer.
+	 */
+	rval = buffer_list_get(ip, &bl);
+	if (rval < 0) {
+		if (rval == -EINVAL) {
+			dev_err(&av->isys->adev->dev,
+				"error: should not happen\n");
+			WARN_ON(1);
+		} else {
+			dev_dbg(&av->isys->adev->dev,
+				"not enough buffers available\n");
+		}
+		goto out;
+	}
+
+	if (!ip->streaming) {
+		dev_dbg(&av->isys->adev->dev,
+			"Wow! Got a buffer to start streaming!\n");
+		rval = ipu_isys_stream_start(ip, &bl, true);
+		if (rval)
+			dev_err(&av->isys->adev->dev,
+				"Ouch. Stream start failed.\n");
+		goto out;
+	}
+
+	msg = ipu_get_fw_msg_buf(ip);
+	if (!msg) {
+		rval = -ENOMEM;
+		ipu_isys_buffer_list_queue(&bl,
+					   IPU_ISYS_BUFFER_LIST_FL_INCOMING, 0);
+		goto out;
+	}
+	buf = to_frame_msg_buf(msg);
+
+	ipu_isys_buffer_list_to_ipu_fw_isys_frame_buff_set(buf, ip, &bl);
+
+	list_for_each_entry(list_ib, &bl.head, head) {
+		if (WARN_ON(nqueued >= ARRAY_SIZE(queued)))
+			break;
+		queued[nqueued++] = list_ib;
+	}
+
+	ipu_fw_isys_dump_frame_buff_set(&pipe_av->isys->adev->dev, buf,
+					ip->nr_output_pins);
+
+	/*
+	 * We must queue the buffers in the buffer list to the
+	 * appropriate video buffer queues BEFORE passing them to the
+	 * firmware since we could get a buffer event back before we
+	 * have queued them ourselves to the active queue.
+	 */
+	ipu_isys_buffer_list_queue(&bl, IPU_ISYS_BUFFER_LIST_FL_ACTIVE, 0);
+
+	rval = ipu_fw_isys_complex_cmd(pipe_av->isys,
+				       ip->stream_handle,
+				       buf, to_dma_addr(msg),
+				       sizeof(*buf),
+				       IPU_FW_ISYS_SEND_TYPE_STREAM_CAPTURE);
+	ipu_put_fw_mgs_buffer(pipe_av->isys, (uintptr_t) buf);
+	if (rval < 0) {
+		dev_err(&av->isys->adev->dev,
+			"failed to queue capture buffer set: %d\n", rval);
+		buffer_list_active_error(ip, queued, nqueued);
+	} else {
+		dev_dbg(&av->isys->adev->dev, "queued buffer\n");
+	}
+
+out:
+	mutex_unlock(&pipe_av->mutex);
+	mutex_lock(&av->mutex);
+}
+
+static void buf_queue(struct vb2_buffer *vb)
+{
+	__buf_queue(vb, false);
+}
+
+int ipu_isys_link_fmt_validate(struct ipu_isys_queue *aq)
+{
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	struct v4l2_subdev_format fmt = { 0 };
+	struct media_pad *pad = media_pad_remote_pad_first(av->vdev.entity.pads);
+	struct v4l2_subdev *sd;
+	int rval;
+
+	if (!pad) {
+		dev_dbg(&av->isys->adev->dev,
+			"video node %s pad not connected\n", av->vdev.name);
+		return -ENOTCONN;
+	}
+
+	sd = media_entity_to_v4l2_subdev(pad->entity);
+
+	fmt.which = V4L2_SUBDEV_FORMAT_ACTIVE;
+	fmt.pad = pad->index;
+	fmt.stream = 0;
+	rval = v4l2_subdev_call(sd, pad, get_fmt, NULL, &fmt);
+	if (rval)
+		return rval;
+
+	if (fmt.format.width != av->mpix.width ||
+	    fmt.format.height != av->mpix.height) {
+		dev_dbg(&av->isys->adev->dev,
+			"wrong width or height %ux%u (%ux%u expected)\n",
+			av->mpix.width, av->mpix.height,
+			fmt.format.width, fmt.format.height);
+		return -EINVAL;
+	}
+
+	if (fmt.format.field != av->mpix.field) {
+		dev_dbg(&av->isys->adev->dev,
+			"wrong field value 0x%8.8x (0x%8.8x expected)\n",
+			av->mpix.field, fmt.format.field);
+		return -EINVAL;
+	}
+
+	if (fmt.format.code != av->pfmt->code) {
+		dev_dbg(&av->isys->adev->dev,
+			"wrong media bus code 0x%8.8x (0x%8.8x expected)\n",
+			av->pfmt->code, fmt.format.code);
+		return -EINVAL;
+	}
+
+	return 0;
+}
+
+/* Return buffers back to videobuf2. */
+static void return_buffers(struct ipu_isys_queue *aq,
+			   enum vb2_buffer_state state)
+{
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	int reset_needed = 0;
+	unsigned long flags;
+
+	spin_lock_irqsave(&aq->lock, flags);
+	while (!list_empty(&aq->incoming)) {
+		struct ipu_isys_buffer *ib = list_first_entry(&aq->incoming,
+							      struct
+							      ipu_isys_buffer,
+							      head);
+		struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+
+		list_del(&ib->head);
+		spin_unlock_irqrestore(&aq->lock, flags);
+
+		vb2_buffer_done(vb, state);
+
+		dev_dbg(&av->isys->adev->dev,
+			"%s: stop_streaming incoming %u\n",
+			ipu_isys_queue_to_video(vb2_queue_to_ipu_isys_queue
+						(vb->vb2_queue))->vdev.name,
+			vb->index);
+
+		spin_lock_irqsave(&aq->lock, flags);
+	}
+
+	/*
+	 * Something went wrong (FW crash / HW hang / not all buffers
+	 * returned from isys) if there are still buffers queued in active
+	 * queue. We have to clean up places a bit.
+	 */
+	while (!list_empty(&aq->active)) {
+		struct ipu_isys_buffer *ib = list_first_entry(&aq->active,
+							      struct
+							      ipu_isys_buffer,
+							      head);
+		struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+
+		list_del(&ib->head);
+		spin_unlock_irqrestore(&aq->lock, flags);
+
+		vb2_buffer_done(vb, state);
+
+		dev_warn(&av->isys->adev->dev, "%s: cleaning active queue %u\n",
+			 ipu_isys_queue_to_video(vb2_queue_to_ipu_isys_queue
+						 (vb->vb2_queue))->vdev.name,
+			 vb->index);
+
+		spin_lock_irqsave(&aq->lock, flags);
+		reset_needed = 1;
+	}
+
+	spin_unlock_irqrestore(&aq->lock, flags);
+
+	if (reset_needed) {
+		mutex_lock(&av->isys->mutex);
+		av->isys->reset_needed = true;
+		mutex_unlock(&av->isys->mutex);
+	}
+}
+
+static int start_streaming(struct vb2_queue *q, unsigned int count)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	struct ipu_isys_video *pipe_av;
+	struct ipu_isys_pipeline *ip;
+	struct ipu_isys_buffer_list __bl, *bl = NULL;
+	bool first;
+	int rval;
+
+	dev_dbg(&av->isys->adev->dev,
+		"stream: %s: width %u, height %u, css pixelformat %u\n",
+		av->vdev.name, av->mpix.width, av->mpix.height,
+		av->pfmt->css_pixelformat);
+
+	mutex_lock(&av->isys->stream_mutex);
+
+	first = !media_entity_pipeline(&av->vdev.entity);
+
+	if (first) {
+		rval = ipu_isys_video_prepare_streaming(av, 1);
+		if (rval)
+			goto out_return_buffers;
+	}
+
+	mutex_unlock(&av->isys->stream_mutex);
+
+	rval = aq->link_fmt_validate(aq);
+	if (rval) {
+		dev_dbg(&av->isys->adev->dev,
+			"%s: link format validation failed (%d)\n",
+			av->vdev.name, rval);
+		goto out_unprepare_streaming;
+	}
+
+	ip = to_ipu_isys_pipeline(media_entity_pipeline(&av->vdev.entity));
+	pipe_av = container_of(ip, struct ipu_isys_video, ip);
+	mutex_unlock(&av->mutex);
+
+	mutex_lock(&pipe_av->mutex);
+	ip->nr_streaming++;
+	dev_dbg(&av->isys->adev->dev, "queue %u of %u\n", ip->nr_streaming,
+		ip->nr_queues);
+	list_add(&aq->node, &ip->queues);
+	if (ip->nr_streaming != ip->nr_queues)
+		goto out;
+
+	if (list_empty(&av->isys->requests)) {
+		bl = &__bl;
+		rval = buffer_list_get(ip, bl);
+		if (rval == -EINVAL) {
+			goto out_stream_start;
+		} else if (rval < 0) {
+			dev_dbg(&av->isys->adev->dev,
+				"no request available --- postponing streamon\n");
+			dev_dbg(&av->isys->adev->dev,
+				"stream postpone details: rval=%d nr_streaming=%u nr_queues=%u requests_empty=%d\n",
+				rval, ip->nr_streaming, ip->nr_queues,
+				list_empty(&av->isys->requests));
+			goto out;
+		}
+	}
+
+	rval = ipu_isys_stream_start(ip, bl, false);
+	if (rval)
+		goto out_stream_start;
+
+out:
+	mutex_unlock(&pipe_av->mutex);
+	mutex_lock(&av->mutex);
+
+	return 0;
+
+out_stream_start:
+	list_del(&aq->node);
+	ip->nr_streaming--;
+	mutex_unlock(&pipe_av->mutex);
+	mutex_lock(&av->mutex);
+
+out_unprepare_streaming:
+	mutex_lock(&av->isys->stream_mutex);
+	if (first)
+		ipu_isys_video_prepare_streaming(av, 0);
+
+out_return_buffers:
+	mutex_unlock(&av->isys->stream_mutex);
+	return_buffers(aq, VB2_BUF_STATE_QUEUED);
+
+	return rval;
+}
+
+static void stop_streaming(struct vb2_queue *q)
+{
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(q);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	struct ipu_isys_pipeline *ip =
+	    to_ipu_isys_pipeline(media_entity_pipeline(&av->vdev.entity));
+	struct ipu_isys_video *pipe_av =
+	    container_of(ip, struct ipu_isys_video, ip);
+	int rval = 0;
+
+	if (pipe_av != av) {
+		mutex_unlock(&av->mutex);
+		mutex_lock(&pipe_av->mutex);
+	}
+
+	mutex_lock(&av->isys->stream_mutex);
+	if (ip->nr_streaming == ip->nr_queues && ip->streaming) {
+		rval = ipu_isys_video_set_streaming(av, 0, NULL);
+		if (rval)
+			dev_err(&av->isys->adev->dev,
+				"failed to stop pipeline during streamoff: %d\n",
+				rval);
+	}
+	if (ip->nr_streaming == 1)
+		ipu_isys_video_prepare_streaming(av, 0);
+	mutex_unlock(&av->isys->stream_mutex);
+
+	if (ip->nr_streaming > 0)
+		ip->nr_streaming--;
+	else
+		WARN_ON(1);
+	if (!list_empty(&aq->node))
+		list_del_init(&aq->node);
+	ip->streaming = 0;
+
+	if (pipe_av != av) {
+		mutex_unlock(&pipe_av->mutex);
+		mutex_lock(&av->mutex);
+	}
+
+	return_buffers(aq, VB2_BUF_STATE_ERROR);
+}
+
+static unsigned int
+get_sof_sequence_by_timestamp(struct ipu_isys_pipeline *ip,
+			      struct ipu_fw_isys_resp_info_abi *info)
+{
+	struct ipu_isys *isys =
+	    container_of(ip, struct ipu_isys_video, ip)->isys;
+	u64 time = (u64) info->timestamp[1] << 32 | info->timestamp[0];
+	unsigned int i;
+
+	for (i = 0; i < IPU_ISYS_MAX_PARALLEL_SOF; i++)
+		if (time == ip->seq[i].timestamp) {
+			dev_dbg(&isys->adev->dev,
+				"sof: using sequence number %u for timestamp 0x%16.16llx\n",
+				ip->seq[i].sequence, time);
+			return ip->seq[i].sequence;
+		}
+
+	dev_dbg(&isys->adev->dev, "SOF: looking for 0x%16.16llx\n", time);
+	for (i = 0; i < IPU_ISYS_MAX_PARALLEL_SOF; i++)
+		dev_dbg(&isys->adev->dev,
+			"SOF: sequence %u, timestamp value 0x%16.16llx\n",
+			ip->seq[i].sequence, ip->seq[i].timestamp);
+	dev_dbg(&isys->adev->dev, "SOF sequence number not found\n");
+
+	return 0;
+}
+
+static u64 get_sof_ns_delta(struct ipu_isys_video *av,
+			    struct ipu_fw_isys_resp_info_abi *info)
+{
+	struct ipu_bus_device *adev = to_ipu_bus_device(&av->isys->adev->dev);
+	struct ipu_device *isp = adev->isp;
+	u64 delta, tsc_now;
+
+	if (!ipu4_buttress_tsc_read(isp, &tsc_now))
+		delta = tsc_now -
+		    ((u64) info->timestamp[1] << 32 | info->timestamp[0]);
+	else
+		delta = 0;
+
+	return ipu4_buttress_tsc_ticks_to_ns(delta);
+}
+
+void
+ipu_isys_buf_calc_sequence_time(struct ipu_isys_buffer *ib,
+				struct ipu_fw_isys_resp_info_abi *info)
+{
+	struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+	struct ipu_isys_queue *aq = vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+	struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+	struct ipu_isys_pipeline *ip =
+	    to_ipu_isys_pipeline(media_entity_pipeline(&av->vdev.entity));
+	u64 ns;
+	u32 sequence;
+
+	if (ip->has_sof) {
+		ns = (wall_clock_ts_on) ? ktime_get_real_ns() : ktime_get_ns();
+		ns -= get_sof_ns_delta(av, info);
+		sequence = get_sof_sequence_by_timestamp(ip, info);
+	} else {
+		ns = ((wall_clock_ts_on) ? ktime_get_real_ns() :
+		      ktime_get_ns());
+		sequence = (atomic_inc_return(&ip->sequence) - 1)
+		    / ip->nr_queues;
+	}
+
+	vbuf->vb2_buf.timestamp = ns;
+	vbuf->sequence = sequence;
+
+	dev_dbg(&av->isys->adev->dev, "buffer: %s: buffer done, CPU-timestamp:%lld, sequence:%d, vc:%d, index:%d, vbuf timestamp:%lld, endl\n",
+		av->vdev.name, ktime_get_ns(), sequence, ip->vc, vb->index, vbuf->vb2_buf.timestamp);
+}
+
+void ipu_isys_queue_buf_done(struct ipu_isys_buffer *ib)
+{
+	struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+
+	if (atomic_read(&ib->str2mmio_flag)) {
+		vb2_buffer_done(vb, VB2_BUF_STATE_ERROR);
+		/*
+		 * Operation on buffer is ended with error and will be reported
+		 * to the userspace when it is de-queued
+		 */
+		atomic_set(&ib->str2mmio_flag, 0);
+	} else {
+		vb2_buffer_done(vb, VB2_BUF_STATE_DONE);
+	}
+}
+
+static void ipu_isys_log_source6_csi_header(struct ipu_isys_pipeline *ip,
+						 struct ipu_isys_video *av,
+						 struct vb2_buffer *vb,
+						 struct ipu_fw_isys_resp_info_abi *info)
+{
+	unsigned int line, lines;
+	unsigned int stride = av->mpix.plane_fmt[0].bytesperline;
+	unsigned int size = vb2_plane_size(vb, 0);
+	void *vaddr;
+
+	if (!av->debug_link_only ||
+	    ip->source != IPU_FW_ISYS_STREAM_SRC_CSI2_PORT0 + 6)
+		return;
+
+	vaddr = vb2_plane_vaddr(vb, 0);
+	if (!vaddr) {
+		dev_info(&av->isys->adev->dev,
+			 "CSI-TAP packet source=6 buffer=%u header-unavailable "
+			 "pin=0x%x error=%d\n", vb->index, info->pin.addr,
+			 info->error_info.error);
+		return;
+	}
+
+	dma_sync_single_for_cpu(av->aq.dev,
+				vb2_dma_contig_plane_dma_addr(vb, 0), size,
+				DMA_FROM_DEVICE);
+	lines = min_t(unsigned int, av->mpix.height, 4);
+	for (line = 0; line < lines; line++) {
+		u32 h0, h1;
+		unsigned int offset = line * stride;
+
+		if (offset + sizeof(h0) + sizeof(h1) > size)
+			break;
+		memcpy(&h0, vaddr + offset, sizeof(h0));
+		memcpy(&h1, vaddr + offset + sizeof(h0), sizeof(h1));
+		dev_info(&av->isys->adev->dev,
+			 "CSI-TAP packet source=6 buffer=%u line=%u vc=%u "
+			 "dtype=0x%x word_count=%u sync=%u stype=%u sid=%u "
+			 "port=%u raw=0x%08x/0x%08x pin=0x%x error=%d\n",
+			 vb->index, line, ip->vc, (h0 >> 16) & 0x1fff,
+			 h0 & 0xffff, (h0 >> 29) & 0x3, h0 >> 31,
+			 h1 & 0xf, (h1 >> 4) & 0xf, h0, h1, info->pin.addr,
+			 info->error_info.error);
+	}
+}
+
+void ipu_isys_queue_buf_ready(struct ipu_isys_pipeline *ip,
+			      struct ipu_fw_isys_resp_info_abi *info)
+{
+	struct ipu_isys *isys =
+	    container_of(ip, struct ipu_isys_video, ip)->isys;
+	struct ipu_isys_queue *aq = ip->output_pins[info->pin_id].aq;
+	struct ipu_isys_buffer *ib;
+	struct vb2_buffer *vb;
+	unsigned long flags;
+	bool first = true;
+	struct vb2_v4l2_buffer *buf;
+
+	dev_dbg(&isys->adev->dev, "buffer: %s: received buffer %8.8x\n",
+		ipu_isys_queue_to_video(aq)->vdev.name, info->pin.addr);
+
+	spin_lock_irqsave(&aq->lock, flags);
+	if (list_empty(&aq->active)) {
+		spin_unlock_irqrestore(&aq->lock, flags);
+		dev_err(&isys->adev->dev, "active queue empty\n");
+		return;
+	}
+
+	list_for_each_entry_reverse(ib, &aq->active, head) {
+		dma_addr_t addr;
+
+		vb = ipu_isys_buffer_to_vb2_buffer(ib);
+		addr = vb2_dma_contig_plane_dma_addr(vb, 0);
+
+		if (info->pin.addr != addr) {
+			if (first)
+				dev_err(&isys->adev->dev,
+					"WARNING: buffer address %pad expected!\n",
+					&addr);
+			first = false;
+			continue;
+		}
+
+		if (info->error_info.error ==
+		    IPU_FW_ISYS_ERROR_HW_REPORTED_STR2MMIO) {
+			ipu_isys_log_source6_csi_header(ip,
+						       ipu_isys_queue_to_video(aq), vb,
+						       info);
+			/*
+			 * While stream-start verification runs, a failed
+			 * D-PHY lock burns one buffer per corrupt frame;
+			 * returning them to a user space that is still
+			 * blocked in STREAMON would starve the fw within
+			 * a few frames and make relock bounces
+			 * unobservable. Park the buffer back on the
+			 * incoming queue instead - the verify loop
+			 * re-feeds it to the fw after each bounce.
+			 */
+			if (!ip->interlaced && !ib->req &&
+			    atomic_read(&ip->verify_active)) {
+				list_move(&ib->head, &aq->incoming);
+				spin_unlock_irqrestore(&aq->lock, flags);
+				return;
+			}
+			/*
+			 * Check for error message:
+			 * 'IPU_FW_ISYS_ERROR_HW_REPORTED_STR2MMIO'
+			 */
+			atomic_set(&ib->str2mmio_flag, 1);
+		}
+		dev_dbg(&isys->adev->dev, "buffer: found buffer %pad\n", &addr);
+		ipu_isys_log_source6_csi_header(ip,
+					       ipu_isys_queue_to_video(aq), vb, info);
+
+		buf = to_vb2_v4l2_buffer(vb);
+		buf->field = V4L2_FIELD_NONE;
+
+		list_del(&ib->head);
+		spin_unlock_irqrestore(&aq->lock, flags);
+
+		ipu_isys_buf_calc_sequence_time(ib, info);
+
+		/*
+		 * For interlaced buffers, the notification to user space
+		 * is postponed to capture_done event since the field
+		 * information is available only at that time.
+		 */
+		if (ip->interlaced) {
+			spin_lock_irqsave(&ip->short_packet_queue_lock, flags);
+			list_add(&ib->head, &ip->pending_interlaced_bufs);
+			spin_unlock_irqrestore(&ip->short_packet_queue_lock,
+					       flags);
+		} else {
+			ipu_isys_queue_buf_done(ib);
+		}
+
+		return;
+	}
+
+	dev_err(&isys->adev->dev,
+		"WARNING: cannot find a matching video buffer!\n");
+
+	spin_unlock_irqrestore(&aq->lock, flags);
+}
+
+void
+ipu_isys_queue_short_packet_ready(struct ipu_isys_pipeline *ip,
+				  struct ipu_fw_isys_resp_info_abi *info)
+{
+	struct ipu_isys *isys =
+	    container_of(ip, struct ipu_isys_video, ip)->isys;
+	unsigned long flags;
+
+	dev_dbg(&isys->adev->dev, "receive short packet buffer %8.8x\n",
+		info->pin.addr);
+	spin_lock_irqsave(&ip->short_packet_queue_lock, flags);
+	ip->cur_field = ipu_isys_csi2_get_current_field(ip, info->timestamp);
+	spin_unlock_irqrestore(&ip->short_packet_queue_lock, flags);
+}
+
+void ipu_isys_req_free(struct media_request *req)
+{
+	struct ipu_isys_request *ireq = to_ipu_isys_request(req);
+
+	kfree(ireq);
+}
+
+struct
+media_request *ipu_isys_req_alloc(struct media_device *mdev)
+{
+	struct ipu_isys_request *ireq;
+
+	ireq = kzalloc(sizeof(*ireq), GFP_KERNEL);
+	if (!ireq)
+		return NULL;
+
+	INIT_LIST_HEAD(&ireq->buffers);
+	spin_lock_init(&ireq->lock);
+	INIT_LIST_HEAD(&ireq->head);
+
+	return &ireq->req;
+}
+
+int ipu_isys_req_prepare(struct media_device *mdev,
+			 struct ipu_isys_request *ireq,
+			 struct ipu_isys_pipeline *ip,
+			 struct ipu_fw_isys_frame_buff_set_abi *set)
+{
+	struct ipu_isys *isys =
+	    container_of(ip, struct ipu_isys_video, ip)->isys;
+	struct media_request *req = &ireq->req;
+	struct ipu_isys_buffer *ib;
+	unsigned long flags;
+
+	dev_dbg(&isys->adev->dev, "%s: preparing request\n", req->debug_str);
+
+	set->send_irq_sof = 1;
+	set->send_resp_sof = 1;
+	set->send_irq_eof = 1;
+	set->send_resp_eof = 1;
+#if defined(CONFIG_VIDEO_INTEL_IPU4) || defined(CONFIG_VIDEO_INTEL_IPU4P)
+	set->send_irq_capture_ack = 1;
+	set->send_irq_capture_done = 1;
+#endif
+
+	spin_lock_irqsave(&ireq->lock, flags);
+
+	list_for_each_entry(ib, &ireq->buffers, req_head) {
+		struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+		struct ipu_isys_queue *aq =
+		    vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+
+		if (aq->prepare_frame_buff_set)
+			aq->prepare_frame_buff_set(vb);
+
+		if (aq->fill_frame_buff_set_pin)
+			aq->fill_frame_buff_set_pin(vb, set);
+
+		spin_lock(&aq->lock);
+		list_move(&ib->head, &aq->active);
+		spin_unlock(&aq->lock);
+	}
+
+	spin_unlock_irqrestore(&ireq->lock, flags);
+
+	return 0;
+}
+
+static int
+ipu_isys_req_dispatch(struct media_device *mdev,
+		      struct ipu_isys_request *ireq,
+		      struct ipu_isys_pipeline *ip,
+		      struct ipu_fw_isys_frame_buff_set_abi *set,
+		      dma_addr_t dma_addr)
+{
+	struct ipu_isys_video *pipe_av =
+	    container_of(ip, struct ipu_isys_video, ip);
+	int rval;
+
+	rval = ipu_fw_isys_complex_cmd(pipe_av->isys,
+				       ip->stream_handle,
+				       set, dma_addr, sizeof(*set),
+				       IPU_FW_ISYS_SEND_TYPE_STREAM_CAPTURE);
+	ipu_put_fw_mgs_buffer(pipe_av->isys, (uintptr_t) set);
+
+	return rval;
+}
+
+void ipu_isys_req_queue(struct media_request *req)
+{
+	struct media_device *mdev = req->mdev;
+	struct ipu_isys *isys = container_of(mdev, struct ipu_isys, media_dev);
+	struct ipu_isys_request *ireq = to_ipu_isys_request(req);
+	struct ipu_isys_pipeline *ip;
+	struct ipu_isys_buffer *ib;
+	struct media_pipeline *pipe = NULL;
+	unsigned long flags;
+	bool no_pipe = false;
+	bool fail_request = false;
+	int rval = 0;
+
+	spin_lock_irqsave(&ireq->lock, flags);
+	if (list_empty(&ireq->buffers)) {
+		rval = -ENODATA;
+		goto out_list_empty;
+	}
+
+	/* Verify that all buffers are related to a single pipeline. */
+	list_for_each_entry(ib, &ireq->buffers, req_head) {
+		struct vb2_buffer *vb = ipu_isys_buffer_to_vb2_buffer(ib);
+		struct ipu_isys_queue *aq =
+		    vb2_queue_to_ipu_isys_queue(vb->vb2_queue);
+		struct ipu_isys_video *av = ipu_isys_queue_to_video(aq);
+
+		dev_dbg(&isys->adev->dev, "%s: device %s, id %u\n", __func__,
+			av->vdev.name, vb->
+			index);
+		if (!pipe) {
+			if (!media_entity_pipeline(&av->vdev.entity)) {
+				no_pipe = true;
+				continue;
+			}
+
+			pipe = media_entity_pipeline(&av->vdev.entity);
+			dev_dbg(&isys->adev->dev, "%s: pipe %p\n",
+				av->vdev.name, pipe);
+			continue;
+		}
+
+		if (media_entity_pipeline(&av->vdev.entity) != pipe) {
+			dev_dbg(&isys->adev->dev,
+				"%s: request includes buffers in multiple pipelines\n",
+				req->debug_str);
+			rval = -EINVAL;
+			fail_request = true;
+			goto out_list_empty;
+		}
+	}
+
+	spin_unlock_irqrestore(&ireq->lock, flags);
+
+	mutex_lock(&isys->stream_mutex);
+
+	ip = pipe ? to_ipu_isys_pipeline(pipe) : NULL;
+	if (pipe && no_pipe) {
+		dev_dbg(&isys->adev->dev,
+			"%s: request includes buffers in and outside pipelines\n",
+			req->debug_str);
+		rval = -EINVAL;
+		fail_request = true;
+		goto out_mutex_unlock;
+	}
+
+	if (pipe && ip->streaming) {
+		struct isys_fw_msgs *msg;
+		struct ipu_fw_isys_frame_buff_set_abi *set;
+
+		msg = ipu_get_fw_msg_buf(ip);
+		if (!msg) {
+			rval = -ENOMEM;
+			fail_request = true;
+			goto out_mutex_unlock;
+		}
+
+		set = to_frame_msg_buf(msg);
+
+		dev_dbg(&isys->adev->dev,
+			"request has a pipeline, dispatching\n");
+		rval = ipu_isys_req_prepare(mdev, ireq, ip, set);
+		if (rval) {
+			ipu_put_fw_mgs_buffer(isys, (uintptr_t)set);
+			fail_request = true;
+			goto out_mutex_unlock;
+		}
+
+		ipu_fw_isys_dump_frame_buff_set(&isys->adev->dev, set,
+						ip->nr_output_pins);
+		rval = ipu_isys_req_dispatch(mdev, ireq, ip, set,
+					      to_dma_addr(msg));
+		if (rval)
+			fail_request = true;
+	} else {
+		dev_dbg(&isys->adev->dev,
+			"%s[%s]: adding request to the mdev queue\n", __func__,
+			req->debug_str);
+
+		list_add(&ireq->head, &isys->requests);
+	}
+
+out_mutex_unlock:
+	mutex_unlock(&isys->stream_mutex);
+	if (fail_request) {
+		dev_err(&isys->adev->dev,
+			"request %s failed to queue: %d\n", req->debug_str, rval);
+		ipu_isys_req_buffer_list_queue(ireq, VB2_BUF_STATE_ERROR);
+	}
+
+	return;
+
+out_list_empty:
+	spin_unlock_irqrestore(&ireq->lock, flags);
+	if (fail_request) {
+		dev_err(&isys->adev->dev,
+			"request %s failed validation: %d\n",
+			req->debug_str, rval);
+		ipu_isys_req_buffer_list_queue(ireq, VB2_BUF_STATE_ERROR);
+	}
+
+	return;
+}
+
+struct vb2_ops ipu_isys_queue_ops = {
+	.queue_setup = queue_setup,
+	.buf_init = buf_init,
+	.buf_prepare = buf_prepare,
+	.buf_finish = buf_finish,
+	.buf_cleanup = buf_cleanup,
+	.start_streaming = start_streaming,
+	.stop_streaming = stop_streaming,
+	.buf_queue = buf_queue,
+};
+
+int ipu_isys_queue_init(struct ipu_isys_queue *aq)
+{
+	struct ipu_isys *isys = ipu_isys_queue_to_video(aq)->isys;
+	int rval;
+
+	if (!aq->vbq.io_modes)
+		aq->vbq.io_modes = VB2_USERPTR | VB2_MMAP | VB2_DMABUF;
+	aq->vbq.drv_priv = aq;
+//	aq->vbq.allow_requests = true;
+	aq->vbq.ops = &ipu_isys_queue_ops;
+	/* vb2 core now drops this lock while waiting (was wait_prepare/finish). */
+	aq->vbq.lock = &ipu_isys_queue_to_video(aq)->mutex;
+	aq->vbq.mem_ops = &vb2_dma_contig_memops;
+	aq->vbq.timestamp_flags = (wall_clock_ts_on) ?
+	    V4L2_BUF_FLAG_TIMESTAMP_UNKNOWN : V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC;
+
+	rval = vb2_queue_init(&aq->vbq);
+	if (rval)
+		return rval;
+
+	aq->dev = &isys->adev->dev;
+	aq->vbq.dev = &isys->adev->dev;
+	spin_lock_init(&aq->lock);
+	INIT_LIST_HEAD(&aq->active);
+	INIT_LIST_HEAD(&aq->incoming);
+
+	return 0;
+}
+
+void ipu_isys_queue_cleanup(struct ipu_isys_queue *aq)
+{
+	if (!aq->vbq.ops)
+		return;
+
+	vb2_queue_release(&aq->vbq);
+}

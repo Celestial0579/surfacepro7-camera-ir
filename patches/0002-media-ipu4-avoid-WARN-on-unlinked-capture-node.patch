@@ -1,0 +1,53 @@
+--- a/drivers/media/pci/intel/ipu-isys-video.c
++++ b/drivers/media/pci/intel/ipu-isys-video.c
+@@ -435,6 +435,12 @@
+ 	return default_pfmt;
+ }
+ 
++/*
++ * A video node has no data link until a pipeline has been configured on it,
++ * and clients such as PipeWire enumerate/TRY every node at login. That is a
++ * perfectly normal state, so report it by returning NULL instead of WARNing:
++ * the WARN_ON(1) that used to be here tainted the kernel ~180 times per boot.
++ */
+ static struct media_pad *other_pad(struct media_pad *pad)
+ {
+ 	struct media_link *link;
+@@ -447,7 +453,6 @@
+ 		return link->source == pad ? link->sink : link->source;
+ 	}
+ 
+-	WARN_ON(1);
+ 	return NULL;
+ }
+ 
+@@ -460,10 +465,9 @@
+ 	const u32 *supported_codes;
+ 	const struct ipu_isys_pixelformat *pfmt;
+ 
+-	if (!pad || !pad->entity) {
+-		WARN_ON(1);
++	/* Not linked yet: no format to report, and not a driver bug. */
++	if (!pad || !pad->entity)
+ 		return NULL;
+-	}
+ 
+ 	sd = media_entity_to_v4l2_subdev(pad->entity);
+ 	supported_codes = to_ipu_isys_subdev(sd)->supported_codes[pad->index];
+@@ -551,6 +555,16 @@
+ 
+ 		f->flags = 0;
+ 		f->pixelformat = pfmt->pixelformat;
++		/*
++		 * The IPU uses private fourccs (include/uapi/linux/ipu4-v4l2.h)
++		 * that the V4L2 core does not know. v4l_fill_fmtdesc() only
++		 * WARNs when the description is left empty, and a client that
++		 * enumerates formats (PipeWire at login) would trigger it once
++		 * per format. Describe our formats here; the core still
++		 * overwrites the description for formats it recognises.
++		 */
++		snprintf(f->description, sizeof(f->description), "%p4cc IPU",
++			 &f->pixelformat);
+ 
+ 		return 0;
+ 	}

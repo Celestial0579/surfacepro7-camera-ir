@@ -1,0 +1,68 @@
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# pacman install scriptlet for the Surface Pro 7 IPU4 camera/IR drivers.
+#
+# Kernel modules are installed below
+#   /usr/lib/modules/<kernelrelease>/extra/surfacepro7-camera-ir/
+# and depmod is re-run for every kernel release that owns that directory.
+
+_sp7_kernelreleases() {
+	local d k found=0
+	for d in /usr/lib/modules/*/extra/surfacepro7-camera-ir /lib/modules/*/extra/surfacepro7-camera-ir; do
+		[ -d "$d" ] || continue
+		k=${d#*/modules/}
+		k=${k%%/*}
+		printf '%s\n' "$k"
+		found=1
+	done
+	# Fall back to the running kernel if the module directory was not found
+	# (for example when /lib is not yet a symlink into /usr/lib).
+	[ "$found" -eq 1 ] || uname -r
+}
+
+_sp7_depmod() {
+	local k
+	for k in $(_sp7_kernelreleases); do
+		echo "==> depmod -a ${k}"
+		depmod -a "$k" || true
+	done
+}
+
+post_install() {
+	_sp7_depmod
+
+	echo "==> surfacepro7-camera-ir installed modules:"
+	find /usr/lib/modules/*/extra/surfacepro7-camera-ir -name '*.ko' 2>/dev/null |
+		sed 's|^|    |'
+
+	cat <<'EOF'
+
+==> Next steps
+    The IPU4P CPD firmware (ipu4p_cpd.bin) is required at runtime for the ISP
+    to boot. It is Microsoft-signed and is NOT part of this package. Install
+    it into /usr/lib/firmware/ before streaming.
+
+    Load the stack with:
+        modprobe intel_ipu4
+        modprobe ov5693 ov8865 ov7251
+        modprobe surfacepro7_acpi
+
+    IR (Howdy) capture: enable the OV7251 STROBE/frame-PWM illuminator with
+        modprobe ov7251 experimental_strobe_output=1
+    See /usr/share/doc/*/README.md for the full bring-up and test commands.
+EOF
+}
+
+post_upgrade() {
+	_sp7_depmod
+}
+
+post_remove() {
+	_sp7_depmod
+}
+
+pre_remove() {
+	# Nothing to do: modules are unloaded by the kernel when they are gone
+	# from the tree after depmod; ask the user to unload explicitly.
+	echo "==> surfacepro7-camera-ir: rmmod intel_ipu4_isys intel_ipu4_psys intel_ipu4 before rebooting if it is still loaded"
+}

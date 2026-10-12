@@ -1,0 +1,52 @@
+# Maintainer: surfacepro7-camera-ir
+#
+# Package B - x86-64-v4 optimised build.
+#
+# Identical sources and module set as PKGBUILD (package A); only the
+# optimisation profile differs:
+#   -O3 -march=x86-64-v4 -mtune=generic -fno-strict-aliasing
+# plus -mgeneral-regs-only, which is mandatory here: -march=x86-64-v4 would
+# otherwise re-enable the SSE/AVX-512 register classes that the kernel does
+# not save/restore across context switches. scripts/verify.sh checks the
+# resulting .ko files for unprotected SIMD/FPU instructions.
+
+pkgname=surfacepro7-camera-ir-ipu4-ov5693-ov8865-ov7251-7x-v4
+pkgver=1
+pkgrel=1
+pkgdesc="Surface Pro 7 IPU4/IPU4P camera + IR drivers (intel_ipu4 core/ISYS/PSYS/MMU/CSI2, ov5693, ov8865, ov7251 IR, SP7 ACPI glue) - x86-64-v4 optimised build"
+arch=('x86_64')
+url="https://github.com/linux-surface/linux-surface"
+license=('GPL-2.0-only')
+depends=('linux')
+optdepends=('v4l-utils: 测试工具 (v4l2-ctl / media-ctl)')
+conflicts=('surfacepro7-camera-ir-ipu4-ov5693-ov8865-ov7251-7x')
+provides=('surfacepro7-camera-ir')
+# Kernel modules must never be stripped nor LTO'd.
+options=('!strip' '!debug' '!lto')
+install=surfacepro7-camera-ir.install
+
+_kernelver="${KERNEL_VERSION:-$(uname -r)}"
+_moddir="usr/lib/modules/${_kernelver}/extra/surfacepro7-camera-ir"
+_kcflags="-O3 -march=x86-64-v4 -mtune=generic -fno-strict-aliasing -mgeneral-regs-only"
+
+build() {
+	cd "$startdir"
+	make clean KERNEL_VERSION="$_kernelver" >/dev/null 2>&1 || true
+	make modules -j"$(nproc)" KERNEL_VERSION="$_kernelver" KCFLAGS="$_kcflags"
+}
+
+package() {
+	cd "$startdir"
+
+	install -d "$pkgdir/$_moddir"
+	find . -name '*.ko' -exec install -m 644 {} "$pkgdir/$_moddir/" \;
+
+	install -d "$pkgdir/usr/share/doc/$pkgname"
+	install -m 644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+	install -m 644 PKGBUILD.v4 "$pkgdir/usr/share/doc/$pkgname/PKGBUILD.v4"
+	install -m 644 dkms.conf "$pkgdir/usr/share/doc/$pkgname/dkms.conf" 2>/dev/null || true
+	if [ -d patches ]; then
+		install -d "$pkgdir/usr/share/doc/$pkgname/patches"
+		install -m 644 patches/*.patch "$pkgdir/usr/share/doc/$pkgname/patches/"
+	fi
+}

@@ -1,0 +1,16 @@
+--- a/drivers/platform/x86/intel/int3472/discrete.c
++++ b/drivers/platform/x86/intel/int3472/discrete.c
+@@ -157,6 +157,13 @@
+ 		.type_to = INT3472_GPIO_TYPE_RESET,
+ 		.con_id = "enable",
+ 	},
++	{	/* The Surface Pro 7 IR sensor's power-enable pin gates its VDDA rail */
++		.hid = "INT347E",
++		.type_from = INT3472_GPIO_TYPE_POWER_ENABLE,
++		.type_to = INT3472_GPIO_TYPE_POWER_ENABLE,
++		.con_id = "vdda",
++		.enable_time_us = GPIO_REGULATOR_ENABLE_TIME,
++	},
+ 	{	/* ov08x40's handshake pin needs a 45 ms delay on some HP laptops */
+ 		.hid = "OVTI08F4",
+ 		.type_from = INT3472_GPIO_TYPE_HANDSHAKE,
