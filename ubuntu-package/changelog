@@ -1,9 +1,17 @@
 surfacepro7-camera (@VERSION@) unstable; urgency=medium
 
+  * sp7-camerad: restart a camera session whose libcamera process exceeds
+    350 MB (SP7_SESSION_RSS_LIMIT_MB). libcamera 0.7.0's GPU debayer leaks
+    one EGLImage per frame (~1.2 MB/min); fixed upstream in 0.7.1.
+
+ -- Tim Heyne <113726264+Celestial0579@users.noreply.github.com>  @DATE@
+
+surfacepro7-camera (0.1.0) unstable; urgency=medium
+
   * Initial package: IPU4P/OV5693/OV8865 drivers (DKMS) with fixes for
     gain step, PCI rename, firmware-auth fail-fast and DKMS module paths;
     IOMMU-identity boot loader; sandboxed on-demand camera daemon with
     suspend handling; udev rules hiding raw ISP nodes; verified firmware
     installer.
 
- -- Tim Heyne <113726264+Celestial0579@users.noreply.github.com>  @DATE@
+ -- Tim Heyne <113726264+Celestial0579@users.noreply.github.com>  Fri, 30 Oct 2026 08:15:00 +0100

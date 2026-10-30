@@ -50,6 +50,11 @@ SENSOR_CAPS = "video/x-raw,width=1920,height=1080"
 OUT_CAPS = f"video/x-raw,format=YUY2,width={WIDTH},height={HEIGHT},framerate={FPS}/1"
 RETRY_MS = 1000
 STOP_TIMEOUT_S = 3
+# libcamera 0.7.0's GPU debayer leaks one EGLImage per frame (~1.2 MB/min,
+# fixed upstream in 0.7.1 by b4ca5e6f). Restart a session whose libcamera
+# process grows beyond this; the OS then reclaims everything it leaked.
+SESSION_RSS_LIMIT_KB = int(os.environ.get("SP7_SESSION_RSS_LIMIT_MB", "350")) * 1024
+RSS_CHECK_MS = 30000
 
 # v4l2loopback client usage event (Ubuntu-compatible id, count is 0 or 1)
 V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000
@@ -192,6 +197,23 @@ class Daemon:
             GLib.io_add_watch(self.watchers[name].fd, GLib.PRIORITY_DEFAULT,
                               GLib.IO_PRI, self.on_event, name)
             log(f"{name}: {dev} ready")
+        GLib.timeout_add(RSS_CHECK_MS, self.check_session_memory)
+
+    def check_session_memory(self):
+        """Recycle a session whose libcamera process has leaked too much."""
+        if self.session and self.session.proc.poll() is None:
+            try:
+                with open(f"/proc/{self.session.proc.pid}/status") as f:
+                    rss = next(int(line.split()[1]) for line in f
+                               if line.startswith("VmRSS:"))
+            except (OSError, StopIteration):
+                return True
+            if rss > SESSION_RSS_LIMIT_KB:
+                name = self.session.name
+                log(f"{name}: camera process uses {rss // 1024} MB, restarting session")
+                self.stop_session()
+                self.start_session(name)
+        return True
 
     def on_event(self, fd, cond, name):
         count = self.watchers[name].read_count()
