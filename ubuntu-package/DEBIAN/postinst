@@ -27,6 +27,11 @@ configure)
 		deb-systemd-helper unmask "$unit" >/dev/null || true
 		deb-systemd-helper enable "$unit" >/dev/null || true
 	done
+	# On upgrade, restart the daemon so the new version runs (the drivers
+	# themselves are only replaced at the next boot).
+	if [ -n "$2" ] && [ -d /run/systemd/system ]; then
+		deb-systemd-invoke try-restart sp7-camerad.service >/dev/null || true
+	fi
 
 	echo
 	if ! sp7-camera-firmware --check >/dev/null 2>&1; then
