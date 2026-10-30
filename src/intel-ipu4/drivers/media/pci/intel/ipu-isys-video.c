@@ -31,9 +31,6 @@
 #include "ipu-fw-isys.h"
 #include "ipu-fw-com.h"
 
-/* Refuse opens for this long after a failed firmware authentication */
-#define IPU_FW_AUTH_BACKOFF	(60 * HZ)
-
 static unsigned int num_stream_support = IPU_ISYS_NUM_STREAMS;
 module_param(num_stream_support, uint, 0660);
 MODULE_PARM_DESC(num_stream_support, "IPU project support number of stream");
@@ -264,7 +261,6 @@ static int video_open(struct file *file)
 	struct ipu_isys *isys = av->isys;
 	struct ipu_bus_device *adev = to_ipu_bus_device(&isys->adev->dev);
 	struct ipu_device *isp = adev->isp;
-	unsigned long failed_at;
 	int rval;
     int retries = 3;
 
@@ -294,20 +290,6 @@ static int video_open(struct file *file)
 		mutex_unlock(&isys->mutex);
 	}
 
-	/*
-	 * Each authentication attempt that fails waits for the CSE to time out,
-	 * so a failing open blocks for tens of seconds. udev's v4l_id opens every
-	 * one of the ~55 video nodes at boot, and with authentication failing
-	 * they all pile up in uninterruptible sleep until reboot. After a
-	 * failure, refuse further opens for a while instead of retrying.
-	 */
-	failed_at = READ_ONCE(isp->fw_auth_failed_at);
-	if (failed_at && time_before(jiffies, failed_at + IPU_FW_AUTH_BACKOFF)) {
-		dev_dbg(&isys->adev->dev,
-			"FW authentication failed recently, not retrying yet\n");
-		return -EIO;
-	}
-
 	do {
 		rval = ipu_buttress_authenticate(isp);
 		if (rval == 0)
@@ -324,10 +306,8 @@ static int video_open(struct file *file)
 
 	if (rval) {
 		dev_err(&isys->adev->dev, "FW authentication failed\n");
-		WRITE_ONCE(isp->fw_auth_failed_at, jiffies ?: 1);
 		return rval;
 	}
-	WRITE_ONCE(isp->fw_auth_failed_at, 0);
 
 	rval = pm_runtime_get_sync(&isys->adev->dev);
 	if (rval < 0) {
