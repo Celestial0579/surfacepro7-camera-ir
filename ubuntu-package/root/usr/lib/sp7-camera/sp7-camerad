@@ -1,0 +1,291 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-only
+"""Surface Pro 7 camera relay daemon.
+
+Feeds the v4l2loopback devices "Surface Camera Front" and "Surface Camera Back"
+from libcamera, on demand. The IPU4P has a single capture path, so only one
+sensor can stream at a time; this daemon owns it and gives it to the camera
+that was requested most recently. A camera that cannot start yet (sensor still
+busy) is retried until it can.
+
+libcamera runs in a short-lived child process per camera session (gst-launch
+writing raw frames to a pipe), never in the daemon itself:
+  - libcamera 0.7's GPU debayer leaks an EGL context (two Mesa threads and
+    tens of MB) per camera start, its CPU debayer aborts on an out-of-range
+    lookup; ending the child returns everything to the OS and a crash only
+    ends that session, which is then retried;
+  - the daemon keeps the loopback outputs open the whole time, so apps always
+    see both cameras.
+
+Replaces two independent v4l2-relayd instances, which raced for the ISP: when
+an app switched cameras it opened the new one before closing the old one, the
+second relay failed with "Camera ... is already in use" and never retried.
+"""
+
+import fcntl
+import glob
+import os
+import signal
+import struct
+import subprocess
+import sys
+
+import gi
+
+gi.require_version("Gst", "1.0")
+gi.require_version("GLib", "2.0")
+gi.require_version("GLibUnix", "2.0")
+from gi.repository import GLib, GLibUnix, Gst  # noqa: E402
+
+CAMERAS = {
+    # name: (libcamera id, v4l2loopback card label)
+    "front": (r"\_SB_.PCI0.I2C2.CAMF", "Surface Camera Front"),
+    "back": (r"\_SB_.PCI0.I2C3.CAMR", "Surface Camera Back"),
+}
+WIDTH, HEIGHT, FPS = 1280, 720, 30
+FRAME_SIZE = WIDTH * HEIGHT * 2  # YUY2
+# Request 1920x1080 from libcamera so it picks the full sensor mode; the binned
+# 1296x972 mode of the OV5693 yields empty frames through the IPU4P.
+SENSOR_CAPS = "video/x-raw,width=1920,height=1080"
+OUT_CAPS = f"video/x-raw,format=YUY2,width={WIDTH},height={HEIGHT},framerate={FPS}/1"
+RETRY_MS = 1000
+STOP_TIMEOUT_S = 3
+
+# v4l2loopback client usage event (Ubuntu-compatible id, count is 0 or 1)
+V4L2_EVENT_PRI_CLIENT_USAGE = 0x08000000
+VIDIOC_SUBSCRIBE_EVENT = 0x4020565A  # _IOW('V', 90, struct v4l2_event_subscription)
+VIDIOC_DQEVENT = 0x80885659  # _IOR('V', 89, struct v4l2_event)
+V4L2_EVENT_SIZE = 136
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def find_loopback(label):
+    for name_file in glob.glob("/sys/devices/virtual/video4linux/video*/name"):
+        with open(name_file) as f:
+            if f.read().strip() == label:
+                return "/dev/" + name_file.split("/")[-2]
+    return None
+
+
+class Output:
+    """appsrc -> v4l2sink into one loopback device, always running.
+
+    One black frame is pushed at start so v4l2sink starts streaming and the
+    loopback device advertises itself as a capture device (exclusive_caps=1).
+    """
+
+    def __init__(self, device):
+        self.pipeline = Gst.parse_launch(
+            f"appsrc name=src is-live=true do-timestamp=true format=time caps={OUT_CAPS} "
+            "! queue max-size-buffers=2 leaky=downstream "
+            # videoconvert negotiates the colorimetry fields v4l2sink insists on
+            f"! videoconvert ! v4l2sink device={device} sync=true"
+        )
+        self.src = self.pipeline.get_by_name("src")
+        self.pipeline.set_state(Gst.State.PLAYING)
+        self.push(bytes([16, 128]) * (WIDTH * HEIGHT))
+
+    def push(self, frame):
+        self.src.emit("push-buffer", Gst.Buffer.new_wrapped(frame))
+
+
+class UsageWatcher:
+    """Reports whether an app is streaming from a loopback device."""
+
+    def __init__(self, device):
+        self.fd = os.open(device, os.O_RDWR | os.O_NONBLOCK)
+        sub = struct.pack("8I", V4L2_EVENT_PRI_CLIENT_USAGE, 0, 0, 0, 0, 0, 0, 0)
+        fcntl.ioctl(self.fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+
+    def read_count(self):
+        """Drain pending events, return the last count or None."""
+        count = None
+        while True:
+            buf = bytearray(V4L2_EVENT_SIZE)
+            try:
+                fcntl.ioctl(self.fd, VIDIOC_DQEVENT, buf)
+            except OSError:
+                return count
+            if struct.unpack_from("I", buf, 0)[0] == V4L2_EVENT_PRI_CLIENT_USAGE:
+                count = struct.unpack_from("I", buf, 8)[0]
+
+
+class Session:
+    """One camera session: a gst-launch child streaming raw frames to a pipe."""
+
+    def __init__(self, name, on_frame, on_exit):
+        cam_id, _ = CAMERAS[name]
+        rfd, wfd = os.pipe()
+        # gst_parse unescapes backslashes, so double them
+        argv = ["gst-launch-1.0", "-q", "libcamerasrc",
+                "camera-name=" + cam_id.replace("\\", "\\\\"),
+                "!", "capsfilter", f"caps={SENSOR_CAPS}",
+                "!", "videoconvert", "!", "videoscale", "!", "videorate",
+                "!", "capsfilter", f"caps={OUT_CAPS}",
+                "!", "fdsink", f"fd={wfd}", "sync=false"]
+        self.proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, pass_fds=(wfd,),
+                                     start_new_session=True)
+        os.close(wfd)
+        self.name = name
+        self.rfd = rfd
+        self.buf = bytearray()
+        self.on_frame = on_frame
+        self.io_id = GLib.io_add_watch(rfd, GLib.PRIORITY_HIGH,
+                                       GLib.IO_IN | GLib.IO_HUP | GLib.IO_ERR, self._readable)
+        self.child_id = GLib.child_watch_add(GLib.PRIORITY_DEFAULT, self.proc.pid,
+                                             lambda pid, status: on_exit(self, status))
+        self.closed = False
+
+    def _readable(self, fd, cond):
+        try:
+            data = os.read(fd, 1 << 20)
+        except BlockingIOError:
+            return True
+        if not data:
+            self.io_id = None
+            return False
+        self.buf += data
+        while len(self.buf) >= FRAME_SIZE:
+            self.on_frame(bytes(self.buf[:FRAME_SIZE]))
+            del self.buf[:FRAME_SIZE]
+        return True
+
+    def stop(self):
+        if self.closed:
+            return
+        self.closed = True
+        if self.io_id:
+            GLib.source_remove(self.io_id)
+            self.io_id = None
+        GLib.source_remove(self.child_id)
+        if self.proc.poll() is None:
+            # SIGINT lets gst-launch stop libcamera cleanly; escalate if needed
+            os.killpg(self.proc.pid, signal.SIGINT)
+            try:
+                self.proc.wait(STOP_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait()
+        os.close(self.rfd)
+
+
+class Daemon:
+    def __init__(self):
+        self.outputs = {}
+        self.watchers = {}
+        self.in_use = {}
+        self.order = []  # cameras with consumers, most recently requested last
+        self.session = None
+        self.retry_id = None
+        self.paused = False  # system suspend in progress
+        for name, (_, label) in CAMERAS.items():
+            dev = find_loopback(label)
+            if not dev:
+                log(f"v4l2loopback device '{label}' missing")
+                sys.exit(1)
+            self.outputs[name] = Output(dev)
+            self.watchers[name] = UsageWatcher(dev)
+            self.in_use[name] = False
+            GLib.io_add_watch(self.watchers[name].fd, GLib.PRIORITY_DEFAULT,
+                              GLib.IO_PRI, self.on_event, name)
+            log(f"{name}: {dev} ready")
+
+    def on_event(self, fd, cond, name):
+        count = self.watchers[name].read_count()
+        if count is not None and (count > 0) != self.in_use[name]:
+            used = count > 0
+            self.in_use[name] = used
+            if name in self.order:
+                self.order.remove(name)
+            if used:
+                self.order.append(name)
+            log(f"{name}: {'requested' if used else 'released'}")
+            self.reconcile()
+        return True
+
+    def wanted(self):
+        if self.paused:
+            return None
+        return self.order[-1] if self.order else None
+
+    def pause(self):
+        """Release the sensor before system suspend.
+
+        The ISYS driver refuses to suspend while a stream is running
+        (isys_suspend returns -EBUSY), which aborts suspend for the whole
+        machine. Called via SIGUSR1 from the system-sleep hook.
+        """
+        log("suspend: releasing camera")
+        self.paused = True
+        self.stop_session()
+        return True
+
+    def resume(self):
+        """Restart the camera after resume if an app still uses it (SIGUSR2)."""
+        log("resume")
+        self.paused = False
+        self.reconcile()
+        return True
+
+    def active(self):
+        return self.session.name if self.session else None
+
+    def reconcile(self):
+        want = self.wanted()
+        if want == self.active():
+            return
+        self.stop_session()
+        if want:
+            self.start_session(want)
+
+    def start_session(self, name):
+        if self.retry_id:
+            GLib.source_remove(self.retry_id)
+            self.retry_id = None
+        self.session = Session(name, self.outputs[name].push, self.on_session_exit)
+        log(f"{name}: camera started (pid {self.session.proc.pid})")
+
+    def stop_session(self):
+        if self.retry_id:
+            GLib.source_remove(self.retry_id)
+            self.retry_id = None
+        if self.session:
+            name = self.session.name
+            self.session.stop()
+            self.session = None
+            log(f"{name}: camera stopped")
+
+    def on_session_exit(self, session, status):
+        if session is not self.session:
+            return
+        log(f"{session.name}: camera process ended unexpectedly (status {status}), retrying")
+        session.stop()
+        self.session = None
+        # Sensor still held by the previous user, or libcamera crashed:
+        # try again while a camera is still wanted.
+        self.retry_id = GLib.timeout_add(RETRY_MS, self.retry)
+
+    def retry(self):
+        self.retry_id = None
+        if self.wanted() and not self.session:
+            self.start_session(self.wanted())
+        return False
+
+
+def main():
+    Gst.init(None)
+    daemon = Daemon()
+    loop = GLib.MainLoop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, sig, loop.quit)
+    GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, daemon.pause)
+    GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR2, daemon.resume)
+    loop.run()
+    daemon.stop_session()
+
+
+if __name__ == "__main__":
+    main()

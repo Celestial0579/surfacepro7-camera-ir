@@ -1,0 +1,19 @@
+#!/bin/sh
+# Surface-Pro-7-Webcams ("Surface Camera Front" / "Surface Camera Back").
+# Sie starten automatisch, sobald eine App sie nutzt, und gehen danach wieder
+# aus - Ein-/Ausschalten ist nicht noetig. Beide gleichzeitig geht nicht
+# (die IPU4P hat nur einen Bildweg).
+#   sp7-camera-status [status]   zeigt Dienste und welche Kamera gerade aktiv ist
+
+sensor() { [ "$(cat /sys/bus/i2c/devices/$1/power/runtime_status 2>/dev/null)" = active ] && echo "aktiv" || echo "ruht"; }
+
+case "${1:-status}" in
+status)
+	echo "Front: Dienst $(systemctl is-active sp7-camerad.service), $(sensor i2c-INT33BE:00)"
+	echo "Back:  Dienst $(systemctl is-active sp7-camerad.service), $(sensor i2c-INT347A:00)"
+	;;
+*)
+	sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//'
+	exit 2
+	;;
+esac

@@ -1,0 +1,25 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+remove)
+	udevadm control --reload || true
+	for unit in sp7-camera.service sp7-camerad.service; do
+		deb-systemd-helper mask "$unit" >/dev/null || true
+	done
+	;;
+purge)
+	rm -rf /var/lib/sp7cam
+	for unit in sp7-camera.service sp7-camerad.service; do
+		deb-systemd-helper purge "$unit" >/dev/null || true
+		deb-systemd-helper unmask "$unit" >/dev/null || true
+	done
+	echo "The camera firmware /usr/lib/firmware/ipu4p_cpd.bin was downloaded"
+	echo "separately and is left in place; remove it by hand if wanted."
+	;;
+esac
+if [ -d /run/systemd/system ]; then
+	systemctl --system daemon-reload >/dev/null || true
+fi
+
+exit 0

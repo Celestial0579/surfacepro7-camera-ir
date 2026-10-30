@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: CC0-1.0
+# Surface Pro 7 Rueckkamera (OV8865) fuer den libcamera Software-ISP.
+# Fester Schwarzwert statt Automatik: Bei hoher Verstaerkung (>8x) haelt die
+# automatische Schwarzwert-Erkennung das Grundrauschen fuer Schwarz und zieht
+# den Bildinhalt ab -> gleichmaessig graues Bild. Der OV8865 liefert einen
+# Pedestal von 16 (10 Bit) = 16 * 64 = 1024 in der 16-Bit-Skala von libcamera.
+%YAML 1.1
+---
+version: 1
+algorithms:
+  - BlackLevel:
+      blackLevel: 1024
+  - Awb:
+  - Adjust:
+  - Agc:
+...

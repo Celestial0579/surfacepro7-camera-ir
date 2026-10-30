@@ -1,0 +1,70 @@
+[Unit]
+Description=Surface Pro 7 Kameras auf Abruf (Surface Camera Front/Back)
+After=sp7-camera.service modprobe@v4l2loopback.service
+Requires=sp7-camera.service
+Wants=modprobe@v4l2loopback.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/sp7-camera/sp7-camerad
+Restart=always
+RestartSec=3
+Nice=5
+Environment=HOME=/var/lib/sp7cam LIBCAMERA_LOG_LEVELS=*:ERROR GST_DEBUG=1 PYTHONUNBUFFERED=1
+
+# Identitaet: eigener Nutzer, keine Rechte darueber hinaus.
+# video: Kamera-/Loopback-Knoten, render: GPU-Debayer. Bildpuffer kommen aus
+# /dev/dma_heap/system (Gruppe sp7cam, siehe 72-sp7-camera-dmaheap.rules).
+User=sp7cam
+Group=sp7cam
+SupplementaryGroups=video render
+StateDirectory=sp7cam
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+
+# Geraete: nur, was der Dienst und sein libcamera-Kindprozess oeffnen.
+DevicePolicy=closed
+DeviceAllow=char-video4linux rw
+DeviceAllow=char-media rw
+DeviceAllow=char-drm rw
+DeviceAllow=/dev/dma_heap/system rw
+
+# Dateisystem und Kernel
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+PrivateIPC=yes
+KeyringMode=private
+RemoveIPC=yes
+
+# Netz: keines. AF_NETLINK fuer libcameras udev-Geraeteerkennung.
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+
+# Systemaufrufe und Prozessverhalten
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+SystemCallErrorNumber=EPERM
+LockPersonality=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+
+# Obergrenzen als Netz gegen Lecks (normal: ~45 MB Dienst + ~150 MB Sitzung)
+MemoryMax=768M
+TasksMax=128
+
+[Install]
+WantedBy=multi-user.target

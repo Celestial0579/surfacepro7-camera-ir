@@ -1,0 +1,29 @@
+#!/bin/sh
+# Surface Pro 7 IPU4P: Der Treiber programmiert physische Adressen in die IPU-MMU,
+# daher muss die IOMMU-Gruppe des ISP (nur 0000:00:05.0) im Identity-Modus laufen.
+# Das geht nur, solange kein Treiber gebunden ist -> vor dem Laden setzen.
+# Wird beim Booten von sp7-camera.service aufgerufen.
+set -e
+DEV=0000:00:05.0
+GRP=/sys/bus/pci/devices/$DEV/iommu_group
+
+[ "$(cat /sys/class/dmi/id/product_name 2>/dev/null)" = "Surface Pro 7" ] ||
+	{ echo "kein Surface Pro 7, nichts zu tun"; exit 0; }
+[ -e /sys/bus/pci/devices/$DEV ] || { echo "ISP $DEV nicht gefunden"; exit 1; }
+[ -f /usr/lib/firmware/ipu4p_cpd.bin ] || { echo "Firmware fehlt - installieren mit: sudo sp7-camera-firmware"; exit 1; }
+modinfo -n intel_ipu4 >/dev/null 2>&1 ||
+	{ echo "intel_ipu4 fuer $(uname -r) nicht gebaut (dkms status pruefen)"; exit 1; }
+
+if [ -e /sys/bus/pci/devices/$DEV/driver ]; then
+	echo "Treiber bereits gebunden"
+else
+	if [ -e "$GRP" ] && [ "$(cat $GRP/type)" != identity ]; then
+		[ "$(ls $GRP/devices)" = "$DEV" ] ||
+			{ echo "IOMMU-Gruppe enthaelt weitere Geraete, Abbruch"; exit 1; }
+		echo identity > $GRP/type
+	fi
+	echo "IOMMU-Gruppe: $(cat $GRP/type 2>/dev/null || echo keine)"
+	modprobe intel_ipu4
+fi
+modprobe surfacepro7_acpi
+echo "Surface-Pro-7-Kamera geladen"

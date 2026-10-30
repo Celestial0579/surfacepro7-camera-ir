@@ -1,0 +1,24 @@
+#!/bin/sh
+set -e
+
+DKMS_NAME=surfacepro7-camera-ir
+DKMS_VER=@VERSION@
+
+case "$1" in
+remove|deconfigure)
+	if [ -d /run/systemd/system ]; then
+		deb-systemd-invoke stop sp7-camerad.service >/dev/null || true
+	fi
+	;;
+esac
+
+case "$1" in
+remove|upgrade|deconfigure)
+	# Modules stay loaded until reboot; they are only removed from disk.
+	if dkms status -m "$DKMS_NAME" -v "$DKMS_VER" | grep -q .; then
+		dkms remove -m "$DKMS_NAME" -v "$DKMS_VER" --all || true
+	fi
+	;;
+esac
+
+exit 0

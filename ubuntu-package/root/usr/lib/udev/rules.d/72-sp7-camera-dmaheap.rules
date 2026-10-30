@@ -1,0 +1,5 @@
+# libcamera (Software-ISP) braucht einen dma-buf-Allokator fuer seine Bildpuffer.
+# Statt /dev/udmabuf (Gruppe kvm, die auch /dev/kvm freigibt) bekommt der
+# Kameradienst-Nutzer sp7cam ueber seine eigene Gruppe den System-DMA-Heap, der
+# sonst nur root offensteht. Keine ACL: logind setzt ACLs bei Sitzungswechseln neu.
+SUBSYSTEM=="dma_heap", KERNEL=="system", GROUP="sp7cam", MODE="0660"

@@ -1,0 +1,22 @@
+Package: surfacepro7-camera
+Version: @VERSION@
+Architecture: all
+Section: kernel
+Priority: optional
+Maintainer: Tim Heyne <113726264+Celestial0579@users.noreply.github.com>
+Homepage: https://github.com/Celestial0579/surfacepro7-camera-ir
+Depends: dkms, v4l2loopback-dkms, python3, python3-gi, gir1.2-glib-2.0, gir1.2-gstreamer-1.0, gstreamer1.0-tools, gstreamer1.0-plugins-base, gstreamer1.0-plugins-good, gstreamer1.0-libcamera, libcamera-ipa, systemd, udev, curl, msitools
+Recommends: v4l-utils
+Conflicts: v4l2-relayd
+Description: Front and rear cameras for the Microsoft Surface Pro 7
+ Makes the Surface Pro 7 front (OV5693) and rear (OV8865) cameras usable
+ as ordinary webcams "Surface Camera Front" and "Surface Camera Back".
+ .
+ Contains the out-of-tree Intel IPU4P ISP and sensor drivers (built with
+ DKMS), a boot service that loads them with the ISP's IOMMU group in
+ identity mode, and sp7-camerad, an unprivileged, sandboxed daemon that
+ starts a camera only while an application uses it. libcamera runs in a
+ short-lived child process per session.
+ .
+ The Microsoft-signed ISP firmware is not included; install it with
+ "sudo sp7-camera-firmware" (downloads and verifies it).

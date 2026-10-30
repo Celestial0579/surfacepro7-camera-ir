@@ -1,0 +1,9 @@
+surfacepro7-camera (@VERSION@) unstable; urgency=medium
+
+  * Initial package: IPU4P/OV5693/OV8865 drivers (DKMS) with fixes for
+    gain step, PCI rename, firmware-auth fail-fast and DKMS module paths;
+    IOMMU-identity boot loader; sandboxed on-demand camera daemon with
+    suspend handling; udev rules hiding raw ISP nodes; verified firmware
+    installer.
+
+ -- Tim Heyne <113726264+Celestial0579@users.noreply.github.com>  @DATE@

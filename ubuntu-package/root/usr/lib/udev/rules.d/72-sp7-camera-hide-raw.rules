@@ -1,0 +1,16 @@
+# Surface Pro 7 (IPU4P): Die ~55 rohen ISP-Knoten liefern nur Bayer-Rohdaten bzw.
+# CSI-2-Paketdumps und sind fuer Apps unbrauchbar. Apps sollen nur die virtuellen
+# "Surface Camera Front/Back" (v4l2loopback) sehen. Zugriff auf die Rohknoten
+# haben root und die Gruppe video (darin: Systemnutzer sp7cam).
+#
+# Warum ein eigener Seat statt TAG-="uaccess": 70-uaccess setzt den Tag, und
+# TAG-= entfernt ihn nur aus CURRENT_TAGS. 73-seat-late prueft aber auch die
+# "klebrigen" TAGS und vergibt die ACL trotzdem. ACLs vergibt logind nur an die
+# aktive Sitzung des Seats, zu dem das Geraet gehoert - an diesem Seat meldet
+# sich nie jemand an, also bekommt kein Nutzer automatisch Zugriff.
+#
+# Abgleich ueber Name/Modell statt DRIVERS==: Die Knoten entstehen waehrend des
+# PCI-Probes, da ist der Treiber am Elterngeraet noch nicht eingetragen.
+SUBSYSTEM=="video4linux", KERNEL=="video*", ATTR{name}=="Intel IPU4*", ENV{ID_SEAT}="seat-sp7cam-raw", TAG-="uaccess"
+SUBSYSTEM=="media", ATTR{model}=="ipu4p", ENV{ID_SEAT}="seat-sp7cam-raw", TAG-="uaccess"
+SUBSYSTEM=="video4linux", KERNEL=="v4l-subdev*", ENV{ID_SEAT}="seat-sp7cam-raw", TAG-="uaccess"

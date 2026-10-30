@@ -1,0 +1,76 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+#
+# Install the IPU4P firmware for the Surface Pro 7 cameras.
+#
+# The firmware (ipu4p_cpd.bin) is signed by Microsoft and may not be
+# redistributed, so this package does not contain it. This command downloads
+# Microsoft's official Surface Pro 7 driver package (~680 MB) over HTTPS,
+# extracts the camera firmware WITHOUT root privileges, checks its SHA-256 and
+# installs it. Nothing else from the driver package is kept.
+#
+#   sudo sp7-camera-firmware            download, verify, install
+#   sudo sp7-camera-firmware --check    only verify an installed firmware
+#   sudo sp7-camera-firmware --file F   install from an already extracted
+#                                       cpd_component_signed.bin
+
+set -eu
+
+URL="https://download.microsoft.com/download/b7ea0d32-93fb-4733-b78c-4263b314dbf4/SurfacePro7_Win11_22621_25.090.3489.0.msi"
+SHA256="ff2c36cc81a5c726508b22970c2e2538ff06107dc5a72c93401403c227e5157f"
+DEST=/usr/lib/firmware/ipu4p_cpd.bin
+MIN_FREE_MB=4500
+
+die() { echo "sp7-camera-firmware: $*" >&2; exit 1; }
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+
+install_fw() {
+	[ "$(sha "$1")" = "$SHA256" ] || die "checksum mismatch for $1 - not installing"
+	install -D -m 0644 "$1" "$DEST"
+	echo "Installed $DEST (SHA-256 verified). Reboot to activate the cameras."
+}
+
+[ "$(id -u)" -eq 0 ] || die "run as root: sudo sp7-camera-firmware"
+
+case "${1:-}" in
+--check)
+	[ -f "$DEST" ] || die "$DEST is missing - run: sudo sp7-camera-firmware"
+	[ "$(sha "$DEST")" = "$SHA256" ] || die "$DEST has an unexpected checksum"
+	echo "$DEST OK (SHA-256 verified)"
+	exit 0
+	;;
+--file)
+	[ -n "${2:-}" ] || die "--file needs a path"
+	install_fw "$2"
+	exit 0
+	;;
+"") ;;
+*) die "unknown option: $1" ;;
+esac
+
+if [ -f "$DEST" ] && [ "$(sha "$DEST")" = "$SHA256" ]; then
+	echo "$DEST is already installed and verified."
+	exit 0
+fi
+
+command -v msiextract >/dev/null || die "msiextract missing (package msitools)"
+command -v curl >/dev/null || die "curl missing"
+
+WORK=$(mktemp -d /var/tmp/sp7-camera-firmware.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT INT TERM
+free=$(df -Pm "$WORK" | awk 'NR==2 {print $4}')
+[ "$free" -ge "$MIN_FREE_MB" ] || die "need ${MIN_FREE_MB} MB free in /var/tmp, have ${free} MB"
+
+# Download and unpack as an unprivileged user: msiextract parses a large
+# third-party archive and must not do that as root.
+chown nobody:nogroup "$WORK"
+drop() { setpriv --reuid=nobody --regid=nogroup --clear-groups --no-new-privs -- "$@"; }
+
+echo "Downloading Microsoft's Surface Pro 7 driver package (~680 MB)..."
+drop curl -fL --proto '=https' --tlsv1.2 --retry 3 -o "$WORK/sp7.msi" "$URL"
+echo "Extracting the camera firmware..."
+drop sh -c 'mkdir "$1/x" && msiextract -C "$1/x" "$1/sp7.msi" >/dev/null' sh "$WORK"
+
+FW=$(find "$WORK/x" -type f -name cpd_component_signed.bin | head -n 1)
+[ -n "$FW" ] || die "camera firmware not found in the driver package"
+install_fw "$FW"

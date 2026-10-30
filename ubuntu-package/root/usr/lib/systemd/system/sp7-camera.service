@@ -1,0 +1,16 @@
+[Unit]
+Description=Surface Pro 7 Kamera (IPU4P) laden
+Documentation=file:///usr/share/doc/surfacepro7-camera/README.md
+ConditionPathExists=/sys/bus/pci/devices/0000:00:05.0
+ConditionPathExists=/usr/lib/firmware/ipu4p_cpd.bin
+After=systemd-modules-load.service systemd-udevd.service
+Before=display-manager.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/sp7-camera/sp7-camera-load
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
